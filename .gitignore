@@ -3,4 +3,7 @@ __pycache__/
 *.py[cod]
 
 # Dataset (muy pesado para GitHub)
-huellas/
+huellas/Persona_1/
+huellas/Persona_2/
+huellas/Persona_3/
+huellas/socofing/
