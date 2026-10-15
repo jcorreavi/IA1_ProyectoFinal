@@ -1,0 +1,6 @@
+# Cache de python
+__pycache__/
+*.py[cod]
+
+# Dataset (muy pesado para GitHub)
+huellas/
