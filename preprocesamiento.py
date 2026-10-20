@@ -674,9 +674,9 @@ def menu_interactivo():
     print("=" * 72)
 
     candidatos = [
-        ("huellas_dataset/Personas", "preprocesadas/huellas_dataset/Personas"),
+        ("dataset_huellas/Personas", "preprocesadas/dataset_huellas/Personas"),
         ("huellas_prueba", "preprocesadas/huellas_prueba"),
-        ("huellas_dataset/Fingerprints", "preprocesadas/huellas_dataset/Fingerprints"),
+        ("dataset_huellas/Fingerprints", "preprocesadas/dataset_huellas/Fingerprints"),
     ]
     disponibles = [(e, s) for e, s in candidatos if os.path.isdir(e)]
 
@@ -731,7 +731,7 @@ def main():
     )
     parser.add_argument(
         "--entrada", type=str, default=None,
-        help="Carpeta de entrada con las imágenes originales (ej: huellas_dataset/Personas)"
+        help="Carpeta de entrada con las imágenes originales (ej: dataset_huellas/Personas)"
     )
     parser.add_argument(
         "--salida", type=str, default=None,
@@ -753,14 +753,14 @@ def main():
     )
     parser.add_argument(
         "--procesar-todo", action="store_true",
-        help="Procesar automáticamente 'huellas_dataset/Personas' y 'huellas_prueba' en 'preprocesadas/'"
+        help="Procesar automáticamente 'dataset_huellas/Personas' y 'huellas_prueba' en 'preprocesadas/'"
     )
 
     args = parser.parse_args()
 
     if args.procesar_todo:
         conjuntos = [
-            ("huellas_dataset/Personas", "preprocesadas/huellas_dataset/Personas"),
+            ("dataset_huellas/Personas", "preprocesadas/dataset_huellas/Personas"),
             ("huellas_prueba", "preprocesadas/huellas_prueba"),
         ]
         for ent, sal in conjuntos:

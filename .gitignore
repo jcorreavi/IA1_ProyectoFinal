@@ -2,9 +2,13 @@
 __pycache__/
 *.py[cod]
 
+# Environments
+.venv/
+
 # Dataset (muy pesado para GitHub)
+dataset_huellas/socofing/
+dataset_huellas/Personas/
 huellas_dataset/socofing/
-huellas_dataset/Persona_2/
-huellas_dataset/Persona_3/
-huellas_dataset/Persona_1/
+huellas_dataset/Personas/
 huellas_prueba
+preprocesadas/
