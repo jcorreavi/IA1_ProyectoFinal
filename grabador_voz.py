@@ -308,24 +308,26 @@ def construir_ruta_metadata(
 
 def resolver_ruta_en_disco(directorio_base: str, ruta_metadata: str) -> str:
     """
-    Resuelve una ruta guardada en metadata.csv hacia la ruta real en el sistema de archivos,
-    funcionando tanto si el script se ejecuta desde la raíz del proyecto como desde otra ubicación.
+    Resuelve una ruta guardada en metadata.csv hacia la ruta real dentro de `directorio_base`,
+    funcionando tanto si el script se ejecuta desde la raíz del proyecto como con `--dataset-dir`.
     """
     ruta_norm = ruta_metadata.replace("\\", "/")
-    if os.path.isfile(ruta_norm):
-        return ruta_norm
-
     padre_base = os.path.dirname(os.path.abspath(directorio_base))
-    candidata = os.path.join(padre_base, ruta_norm)
-    if os.path.isfile(candidata):
-        return candidata
+    candidata_padre = os.path.join(padre_base, ruta_norm)
+    if os.path.isfile(candidata_padre):
+        return candidata_padre
 
     partes = ruta_norm.split("/")
     if len(partes) >= 3:
         candidata_interna = os.path.join(directorio_base, *partes[-3:])
+        if os.path.isfile(candidata_interna):
+            return candidata_interna
         return candidata_interna
 
-    return candidata
+    if os.path.isfile(ruta_norm):
+        return ruta_norm
+
+    return candidata_padre
 
 
 def contar_audios_persona(directorio_base: str, persona: str) -> Dict[str, int]:
@@ -1008,9 +1010,212 @@ def mostrar_estado_dataset(directorio_base: str) -> None:
     print(f"\n - Filas registradas en metadata.csv : {len(registros)}")
     if faltantes > 0:
         print(f" - [!] Archivos listados en CSV que no están en disco: {faltantes}")
+        print("       (Podés usar la opción [5] -> Sincronizar metadata.csv para repararlo)")
     else:
         print(" - Integridad de rutas en metadata.csv: OK (todos los archivos existen)")
     print("=" * 72)
+
+
+# ==============================================================================
+# BORRADO SEGURO DE GRABACIONES Y SINCRONIZACIÓN DE METADATA.CSV
+# ==============================================================================
+
+def reescribir_metadata_seguro(
+    directorio_base: str, filas: List[Dict[str, object]]
+) -> None:
+    """
+    Reescribe el archivo metadata.csv de manera atómica (usando un archivo temporal
+    en el mismo directorio y `os.replace`) para evitar corrupción de datos.
+    """
+    os.makedirs(directorio_base, exist_ok=True)
+    ruta_csv = obtener_ruta_metadata(directorio_base)
+    fd_temp, ruta_temp = tempfile.mkstemp(
+        prefix=".tmp_meta_", suffix=".csv", dir=directorio_base
+    )
+    os.close(fd_temp)
+
+    try:
+        with open(ruta_temp, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNAS_METADATA)
+            writer.writeheader()
+            for fila in filas:
+                fila_limpia = {col: fila.get(col, "") for col in COLUMNAS_METADATA}
+                writer.writerow(fila_limpia)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(ruta_temp, ruta_csv)
+    except Exception:
+        if os.path.exists(ruta_temp):
+            try:
+                os.remove(ruta_temp)
+            except OSError:
+                pass
+        raise
+
+
+def sincronizar_metadata_con_disco(directorio_base: str) -> Tuple[int, int, int]:
+    """
+    Sincroniza `metadata.csv` con los archivos WAV realmente existentes en `dataset_voz/`:
+    1. Elimina del CSV cualquier fila cuyo archivo `.wav` haya sido borrado en disco.
+    2. Escanea las carpetas `<Persona>/<Comando>/*.wav` y agrega al CSV cualquier
+       grabación válida que no estuviera registrada.
+    Retorna `(filas_eliminadas, filas_agregadas, total_final)`.
+    """
+    registros_actuales = leer_registros_metadata(directorio_base)
+    filas_validas: List[Dict[str, object]] = []
+    rutas_registradas = set()
+    eliminadas = 0
+
+    for reg in registros_actuales:
+        ruta_rel = reg.get("ruta_audio", "").replace("\\", "/")
+        ruta_disco = resolver_ruta_en_disco(directorio_base, ruta_rel)
+        if ruta_rel and os.path.isfile(ruta_disco):
+            filas_validas.append(reg)
+            rutas_registradas.add(os.path.abspath(ruta_disco))
+        else:
+            eliminadas += 1
+
+    # Buscar archivos WAV en disco que no estén en el CSV
+    agregadas = 0
+    patron_toma = re.compile(r"_toma_(\d+)\.wav$", flags=re.IGNORECASE)
+    if os.path.isdir(directorio_base):
+        for persona in sorted(os.listdir(directorio_base)):
+            ruta_p = os.path.join(directorio_base, persona)
+            if not os.path.isdir(ruta_p) or persona.startswith("."):
+                continue
+            for cmd in COMANDOS_PROYECTO:
+                ruta_c = os.path.join(ruta_p, cmd)
+                if not os.path.isdir(ruta_c):
+                    continue
+                for nombre_wav in sorted(os.listdir(ruta_c)):
+                    if not nombre_wav.lower().endswith(".wav") or nombre_wav.startswith("."):
+                        continue
+                    ruta_abs = os.path.abspath(os.path.join(ruta_c, nombre_wav))
+                    if ruta_abs in rutas_registradas:
+                        continue
+                    # Leer propiedades del WAV para reconstruir la fila
+                    try:
+                        with wave.open(ruta_abs, "rb") as wf:
+                            sr = wf.getframerate()
+                            n_frames = wf.getnframes()
+                            dur = n_frames / float(sr) if sr > 0 else 0.0
+                    except Exception:
+                        continue
+
+                    m = patron_toma.search(nombre_wav)
+                    num_toma = int(m.group(1)) if m else 1
+                    mtime = os.path.getmtime(ruta_abs)
+                    fecha_str = datetime.datetime.fromtimestamp(mtime).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    filas_validas.append(
+                        {
+                            "ruta_audio": construir_ruta_metadata(
+                                directorio_base, persona, cmd, nombre_wav
+                            ),
+                            "persona": persona,
+                            "comando": cmd,
+                            "numero_toma": num_toma,
+                            "fecha_hora": fecha_str,
+                            "duracion_seg": f"{dur:.2f}",
+                            "frecuencia_muestreo": sr,
+                        }
+                    )
+                    agregadas += 1
+
+    reescribir_metadata_seguro(directorio_base, filas_validas)
+    return eliminadas, agregadas, len(filas_validas)
+
+
+def eliminar_set_comando(
+    directorio_base: str, persona: str, comando: str
+) -> Tuple[int, int]:
+    """
+    Borra todos los archivos `.wav` de un comando específico de una persona
+    (ej. todo `Persona_02/Identificar`) y limpia sus filas de `metadata.csv`.
+    Retorna `(archivos_borrados, filas_csv_eliminadas)`.
+    """
+    carpeta_cmd = os.path.join(directorio_base, persona, comando)
+    archivos_borrados = 0
+    if os.path.isdir(carpeta_cmd):
+        for f in os.listdir(carpeta_cmd):
+            if f.lower().endswith(".wav"):
+                try:
+                    os.remove(os.path.join(carpeta_cmd, f))
+                    archivos_borrados += 1
+                except OSError as exc:
+                    print(f" [!] No se pudo borrar '{f}': {exc}")
+
+    registros = leer_registros_metadata(directorio_base)
+    nuevas_filas = [
+        r
+        for r in registros
+        if not (r.get("persona") == persona and r.get("comando") == comando)
+    ]
+    filas_quitadas = len(registros) - len(nuevas_filas)
+    reescribir_metadata_seguro(directorio_base, nuevas_filas)
+    return archivos_borrados, filas_quitadas
+
+
+def eliminar_tomas_especificas(
+    directorio_base: str, persona: str, comando: str, numeros_toma: List[int]
+) -> Tuple[int, int]:
+    """
+    Borra únicamente los números de toma indicados para una persona y comando,
+    tanto en disco como en `metadata.csv`.
+    Retorna `(archivos_borrados, filas_csv_eliminadas)`.
+    """
+    conjunto_nums = set(numeros_toma)
+    archivos_borrados = 0
+    carpeta_cmd = os.path.join(directorio_base, persona, comando)
+
+    for num in sorted(conjunto_nums):
+        nombre_wav = construir_nombre_archivo(persona, comando, num)
+        ruta_wav = os.path.join(carpeta_cmd, nombre_wav)
+        if os.path.isfile(ruta_wav):
+            try:
+                os.remove(ruta_wav)
+                archivos_borrados += 1
+            except OSError as exc:
+                print(f" [!] Error al borrar '{ruta_wav}': {exc}")
+
+    registros = leer_registros_metadata(directorio_base)
+    nuevas_filas = []
+    for r in registros:
+        es_misma_pc = r.get("persona") == persona and r.get("comando") == comando
+        try:
+            num_fila = int(r.get("numero_toma", -1))
+        except ValueError:
+            num_fila = -1
+        if es_misma_pc and num_fila in conjunto_nums:
+            continue
+        nuevas_filas.append(r)
+
+    filas_quitadas = len(registros) - len(nuevas_filas)
+    reescribir_metadata_seguro(directorio_base, nuevas_filas)
+    return archivos_borrados, filas_quitadas
+
+
+def eliminar_persona_completa(
+    directorio_base: str, persona: str
+) -> Tuple[int, int]:
+    """
+    Elimina la carpeta completa de una persona (`dataset_voz/<Persona>`) junto con
+    todos sus audios y borra todas sus entradas en `metadata.csv`.
+    Retorna `(archivos_borrados, filas_csv_eliminadas)`.
+    """
+    conteo = contar_audios_persona(directorio_base, persona)
+    archivos_borrados = sum(conteo.values())
+
+    ruta_persona = os.path.join(directorio_base, persona)
+    if os.path.isdir(ruta_persona):
+        shutil.rmtree(ruta_persona)
+
+    registros = leer_registros_metadata(directorio_base)
+    nuevas_filas = [r for r in registros if r.get("persona") != persona]
+    filas_quitadas = len(registros) - len(nuevas_filas)
+    reescribir_metadata_seguro(directorio_base, nuevas_filas)
+    return archivos_borrados, filas_quitadas
 
 
 # ==============================================================================
@@ -1234,6 +1439,131 @@ def _configurar_audio_menu(
     return nuevo_sr, nueva_duracion, nuevo_disp
 
 
+def _menu_borrar_y_sincronizar(
+    directorio_base: str, persona_activa: Optional[str] = None
+) -> Optional[str]:
+    """
+    Submenú para borrar de forma segura sets de comandos, tomas específicas o
+    personas completas manteniendo `metadata.csv` siempre sincronizado.
+    Devuelve la `persona_activa` actualizada (o None si fue eliminada).
+    """
+    while True:
+        personas = listar_personas_existentes(directorio_base)
+        print("\n" + "=" * 72)
+        print(" BORRADO SEGURO Y SINCRONIZACIÓN DE METADATA.CSV")
+        print("=" * 72)
+        print("   [1] Borrar todo un comando de una persona (ej. rehacer todo «Reconocer» de Persona_01)")
+        print("   [2] Borrar tomas puntuales de un comando (ej. borrar toma 2 y 5)")
+        print("   [3] Borrar una persona completa (todas sus carpetas y grabaciones)")
+        print("   [4] Sincronizar metadata.csv con las carpetas (repara el CSV si borraste archivos a mano)")
+        print("   [0] Volver al menú principal")
+        print("=" * 72)
+
+        op = input(" Seleccioná una opción [Default: 0]: ").strip()
+        if not op or op == "0":
+            return persona_activa
+
+        if op == "4":
+            elim, agreg, total = sincronizar_metadata_con_disco(directorio_base)
+            print(
+                f"\n [+] Sincronización completada en metadata.csv:\n"
+                f"     - Filas huérfanas eliminadas : {elim}\n"
+                f"     - Archivos nuevos agregados  : {agreg}\n"
+                f"     - Total de audios válidos    : {total}"
+            )
+            continue
+
+        if not personas:
+            print(" [i] No hay personas registradas en el dataset para borrar.")
+            continue
+
+        # Seleccionar persona sobre la cual operar
+        print("\n Personas disponibles:")
+        for idx, p in enumerate(personas, 1):
+            c = contar_audios_persona(directorio_base, p)
+            resumen = ", ".join(f"{cmd}: {c[cmd]}" for cmd in COMANDOS_PROYECTO)
+            print(f"   [{idx}] {p} ({resumen})")
+        print("   [0] Cancelar")
+
+        op_p = input(" Elegí el número de la persona: ").strip()
+        if not op_p.isdigit() or not (1 <= int(op_p) <= len(personas)):
+            print(" [i] Operación cancelada.")
+            continue
+        persona_obj = personas[int(op_p) - 1]
+
+        if op == "1":
+            # Borrar todo un comando de esa persona
+            cmd_obj = _seleccionar_comando_menu(directorio_base, persona_obj)
+            if not cmd_obj:
+                continue
+            conf = input(
+                f" ¿Confirmás borrar TODAS las tomas de «{cmd_obj}» para '{persona_obj}'? [s/N]: "
+            ).strip().lower()
+            if conf in ("s", "si", "sí", "y", "yes"):
+                n_wav, n_csv = eliminar_set_comando(
+                    directorio_base, persona_obj, cmd_obj
+                )
+                print(
+                    f"\n [+] Set eliminado: {n_wav} archivos WAV borrados y "
+                    f"{n_csv} filas quitadas de metadata.csv."
+                )
+            else:
+                print(" [i] Cancelado.")
+
+        elif op == "2":
+            # Borrar tomas específicas
+            cmd_obj = _seleccionar_comando_menu(directorio_base, persona_obj)
+            if not cmd_obj:
+                continue
+            carpeta_c = os.path.join(directorio_base, persona_obj, cmd_obj)
+            archivos = (
+                sorted(f for f in os.listdir(carpeta_c) if f.lower().endswith(".wav"))
+                if os.path.isdir(carpeta_c)
+                else []
+            )
+            if not archivos:
+                print(f" [i] '{persona_obj}' no tiene grabaciones en «{cmd_obj}».")
+                continue
+
+            print(f"\n Tomas actuales en {persona_obj} -> «{cmd_obj}»:")
+            for f in archivos:
+                print(f"   - {f}")
+            entrada_nums = input(
+                "\n Ingresá los números de toma a borrar separados por coma (ej: 1,3 o 5): "
+            ).strip()
+            nums = [
+                int(x.strip())
+                for x in entrada_nums.replace(";", ",").split(",")
+                if x.strip().isdigit()
+            ]
+            if not nums:
+                print(" [i] No se indicaron números válidos. Cancelado.")
+                continue
+            n_wav, n_csv = eliminar_tomas_especificas(
+                directorio_base, persona_obj, cmd_obj, nums
+            )
+            print(
+                f"\n [+] Tomas eliminadas: {n_wav} archivos WAV borrados y "
+                f"{n_csv} filas quitadas de metadata.csv."
+            )
+
+        elif op == "3":
+            # Borrar persona completa
+            conf = input(
+                f" ¿Confirmás borrar TODA la carpeta de '{persona_obj}' y todos sus audios? [s/N]: "
+            ).strip().lower()
+            if conf in ("s", "si", "sí", "y", "yes"):
+                n_wav, n_csv = eliminar_persona_completa(directorio_base, persona_obj)
+                if persona_activa == persona_obj:
+                    persona_activa = None
+                print(
+                    f"\n [+] Persona '{persona_obj}' eliminada: {n_wav} archivos WAV borrados y "
+                    f"{n_csv} filas quitadas de metadata.csv."
+                )
+            else:
+                print(" [i] Cancelado.")
+
+
 def menu_interactivo(
     directorio_base: str = DIRECTORIO_DATASET_DEFAULT,
     sample_rate_inicial: int = SAMPLE_RATE_DEFAULT,
@@ -1269,7 +1599,8 @@ def menu_interactivo(
         print("   [2] Cambiar o registrar persona activa")
         print("   [3] Grabar otro comando para la persona activa")
         print("   [4] Ver resumen y auditoría del dataset actual")
-        print("   [5] Configurar duración, frecuencia de muestreo o micrófono")
+        print("   [5] Borrar grabaciones o sincronizar metadata.csv")
+        print("   [6] Configurar duración, frecuencia de muestreo o micrófono")
         print("   [0] Salir del programa")
         print("=" * 72)
 
@@ -1387,6 +1718,11 @@ def menu_interactivo(
             mostrar_estado_dataset(directorio_base)
 
         elif opcion == "5":
+            persona_activa = _menu_borrar_y_sincronizar(
+                directorio_base, persona_activa=persona_activa
+            )
+
+        elif opcion == "6":
             sample_rate, duracion_predeterminada, dispositivo_mic = (
                 _configurar_audio_menu(
                     sample_rate_actual=sample_rate,
@@ -1396,7 +1732,7 @@ def menu_interactivo(
             )
 
         else:
-            print(" [!] Opción no reconocida. Elegí un número entre 0 y 5.")
+            print(" [!] Opción no reconocida. Elegí un número entre 0 y 6.")
 
 
 # ==============================================================================
@@ -1434,8 +1770,23 @@ def main() -> None:
         action="store_true",
         help="Mostrar únicamente el resumen de auditoría del dataset actual y salir",
     )
+    parser.add_argument(
+        "--sincronizar",
+        action="store_true",
+        help="Sincronizar metadata.csv con los archivos reales en dataset_voz/ y salir",
+    )
 
     args = parser.parse_args()
+
+    if args.sincronizar:
+        asegurar_archivo_metadata(args.dataset_dir)
+        elim, agreg, total = sincronizar_metadata_con_disco(args.dataset_dir)
+        print(
+            f"[+] Sincronización completada: {elim} filas huérfanas eliminadas, "
+            f"{agreg} archivos agregados. Total actual en CSV: {total}."
+        )
+        mostrar_estado_dataset(args.dataset_dir)
+        return
 
     if args.resumen:
         asegurar_archivo_metadata(args.dataset_dir)
