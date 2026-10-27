@@ -351,33 +351,302 @@ def _arecord_disponible() -> bool:
     return shutil.which("arecord") is not None
 
 
+def _es_captura_saturada_dc(audio_int16: np.ndarray) -> bool:
+    """
+    Detecta si un buffer capturado proviene de una entrada analógica desconectada
+    o bloqueada en continua (por ejemplo, clavada en -32768 / -1.0 como ocurre en
+    algunos jacks analógicos ALSA sin micrófono enchufado).
+    """
+    if audio_int16.size == 0:
+        return True
+    norm = audio_int16.astype(np.float32) / 32768.0
+    media = float(np.mean(norm))
+    desvio_ac = float(np.std(norm - media))
+    frac_clavada = float(np.mean(np.abs(norm) >= 0.999))
+    # Si más del 50% de las muestras están clavadas al riel o hay gran DC sin variación AC
+    if frac_clavada > 0.50:
+        return True
+    if abs(media) > 0.35 and desvio_ac < 0.01:
+        return True
+    return False
+
+
+def _capturar_con_arecord(num_muestras: int, sample_rate: int) -> np.ndarray:
+    """Captura audio mono S16_LE usando `arecord` (enrutado por PipeWire/ALSA default)."""
+    fd_temp, ruta_temp = tempfile.mkstemp(prefix=".tmp_arecord_", suffix=".wav")
+    os.close(fd_temp)
+    try:
+        cmd = [
+            "arecord",
+            "-q",
+            "-f",
+            "S16_LE",
+            "-c",
+            str(CANALES_DEFAULT),
+            "-r",
+            str(sample_rate),
+            "-t",
+            "wav",
+            "--samples",
+            str(num_muestras),
+            ruta_temp,
+        ]
+        subprocess.run(cmd, check=True)
+        with wave.open(ruta_temp, "rb") as wf:
+            raw_bytes = wf.readframes(wf.getnframes())
+            audio = np.frombuffer(raw_bytes, dtype=np.int16).copy()
+        return audio[:num_muestras]
+    finally:
+        if os.path.exists(ruta_temp):
+            try:
+                os.remove(ruta_temp)
+            except OSError:
+                pass
+
+
+def _elegir_mejor_dispositivo_sounddevice() -> Optional[int]:
+    """
+    En Linux con PipeWire/PulseAudio, PortAudio suele elegir por error el jack
+    analógico desconectado (ej. 'SN6140 Analog') en vez de PipeWire o el micrófono
+    digital integrado ('acp-pdm-mach' / 'dmic'). Prioriza pipewire -> pulse -> default -> dmic.
+    """
+    if not SOUNDDEVICE_DISPONIBLE:
+        return None
+    try:
+        todos = sd.query_devices()
+        prioridades = ("pipewire", "pulse", "default", "pdm", "dmic")
+        for palabra in prioridades:
+            for idx, dev in enumerate(todos):
+                if int(dev.get("max_input_channels", 0)) > 0:
+                    nombre = str(dev.get("name", "")).lower()
+                    if palabra in nombre:
+                        return idx
+    except Exception:
+        pass
+    return None
+
+
+def _obtener_info_fuente_pipewire() -> Optional[str]:
+    """
+    Consulta a PipeWire/WirePlumber (`wpctl`) cuál es exactamente el micrófono
+    físico seleccionado actualmente en la configuración de sonido de Ubuntu,
+    incluyendo su placa ALSA, volumen y si está silenciado (MUTED).
+    """
+    if shutil.which("wpctl") is None:
+        return None
+    try:
+        res_insp = subprocess.run(
+            ["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if res_insp.returncode != 0 or not res_insp.stdout:
+            return None
+
+        desc = ""
+        alsa_card = ""
+        alsa_name = ""
+        for linea in res_insp.stdout.splitlines():
+            m_desc = re.search(r'node\.description\s*=\s*"([^"]+)"', linea)
+            if m_desc:
+                desc = m_desc.group(1).strip()
+            m_card = re.search(r'alsa\.card_name\s*=\s*"([^"]+)"', linea)
+            if m_card:
+                alsa_card = m_card.group(1).strip()
+            m_aname = re.search(r'alsa\.name\s*=\s*"([^"]+)"', linea)
+            if m_aname:
+                alsa_name = m_aname.group(1).strip()
+
+        vol_info = ""
+        res_vol = subprocess.run(
+            ["wpctl", "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if res_vol.returncode == 0 and res_vol.stdout:
+            m_v = re.search(r"([0-9]+(?:\.[0-9]+)?)", res_vol.stdout)
+            if m_v:
+                vol_pct = int(round(float(m_v.group(1)) * 100))
+                vol_info = f", Vol: {vol_pct}%"
+            if "MUTED" in res_vol.stdout.upper():
+                vol_info += " [¡SILENCIADO/MUTED!]"
+
+        etiqueta_hw = alsa_name or alsa_card
+        nombre_base = desc or etiqueta_hw or "Fuente PipeWire predeterminada"
+        if etiqueta_hw and etiqueta_hw.lower() not in nombre_base.lower():
+            texto = f"{nombre_base} [{etiqueta_hw}{vol_info}]"
+        else:
+            texto = f"{nombre_base} [{vol_info.lstrip(', ') or 'PipeWire'}]"
+
+        if "sn6140" in (alsa_name + " " + desc).lower():
+            texto += " [¡OJO: Jack analógico seleccionado!]"
+        return texto
+    except Exception:
+        return None
+
+
+def listar_fuentes_pipewire() -> List[Tuple[str, str, bool]]:
+    """
+    Parsea la sección Audio -> Sources de `wpctl status` y devuelve una lista de
+    tuplas `(id_wpctl, descripcion, es_predeterminado)`.
+    """
+    if shutil.which("wpctl") is None:
+        return []
+    try:
+        res = subprocess.run(
+            ["wpctl", "status"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if res.returncode != 0:
+            return []
+
+        en_audio = False
+        en_sources = False
+        fuentes: List[Tuple[str, str, bool]] = []
+        for linea in res.stdout.splitlines():
+            limpia = linea.strip()
+            if limpia.startswith("Audio"):
+                en_audio = True
+                continue
+            if en_audio and limpia.startswith("Video"):
+                break
+            if en_audio and ("Sources:" in linea):
+                en_sources = True
+                continue
+            if en_sources:
+                if any(
+                    sec in linea
+                    for sec in ("Filters:", "Streams:", "Sinks:", "Devices:", "Settings")
+                ):
+                    en_sources = False
+                    continue
+                m = re.search(r"(\*?)\s*(\d+)\.\s+(.+)$", linea)
+                if m:
+                    activo = m.group(1) == "*"
+                    id_num = m.group(2)
+                    nombre_f = m.group(3).strip()
+                    fuentes.append((id_num, nombre_f, activo))
+        return fuentes
+    except Exception:
+        return []
+
+
+def menu_cambiar_microfono_sistema() -> None:
+    """
+    Permite ver qué micrófono está activo en Ubuntu (PipeWire) y cambiarlo
+    directamente desde la consola usando `wpctl set-default <ID>`.
+    """
+    print("\n" + "=" * 72)
+    print(" SELECCIÓN DE MICRÓFONO ACTIVO DEL SISTEMA (PIPEWIRE / UBUNTU)")
+    print("=" * 72)
+    fuentes = listar_fuentes_pipewire()
+    if not fuentes:
+        info = _obtener_info_fuente_pipewire()
+        if info:
+            print(f" Micrófono actual: {info}")
+        else:
+            print(" [!] No se pudo consultar la lista de fuentes de PipeWire (`wpctl status`).")
+            disps = listar_dispositivos_entrada()
+            if disps:
+                print("\n Dispositivos ALSA/PortAudio detectados:")
+                for idx, nom, ch in disps:
+                    print(f"   - [{idx}] {nom} ({ch} canales)")
+        print("=" * 72)
+        return
+
+    print(" Micrófonos disponibles en Ubuntu (el '*' indica el activo actualmente):")
+    for idx_lista, (id_wp, nombre_f, activo) in enumerate(fuentes, 1):
+        marca = " * [ACTIVO AHORA]" if activo else ""
+        print(f"   [{idx_lista}] (ID PipeWire {id_wp}) {nombre_f}{marca}")
+    print("   [0] Volver sin cambiar")
+
+    op = input("\n Elegí el micrófono que querés activar (1..N) [Default: 0]: ").strip()
+    if not op or op == "0":
+        return
+    if op.isdigit() and 1 <= int(op) <= len(fuentes):
+        id_elegido, nom_elegido, _ = fuentes[int(op) - 1]
+        res = subprocess.run(
+            ["wpctl", "set-default", id_elegido],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            # Asegurar que no esté silenciado (unmute)
+            subprocess.run(
+                ["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "0"],
+                capture_output=True,
+                check=False,
+            )
+            print(f"\n [+] Micrófono activo cambiado a: {nom_elegido}")
+        else:
+            print(f"\n [!] Error al cambiar de micrófono: {res.stderr.strip()}")
+    else:
+        print(" [!] Opción fuera de rango.")
+
+
 def verificar_disponibilidad_microfono(
     dispositivo: Optional[int] = None, sample_rate: int = SAMPLE_RATE_DEFAULT
 ) -> Tuple[bool, str, str]:
     """
-    Comprueba qué motor de captura está disponible y si existe un micrófono
-    accesible con la frecuencia de muestreo solicitada.
-
-    Retorna:
-        (disponible: bool, backend: str, detalle: str)
-        donde backend puede ser 'sounddevice', 'arecord' o 'ninguno'.
+    Comprueba qué motor de captura está disponible y devuelve el nombre real del
+    micrófono activo en el sistema (consultando PipeWire `wpctl` en Linux o `sounddevice`).
     """
+    usar_arecord_preferido = (
+        sys.platform.startswith("linux")
+        and dispositivo is None
+        and _arecord_disponible()
+    )
+
+    if usar_arecord_preferido:
+        try:
+            res = subprocess.run(
+                ["arecord", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if res.returncode == 0 and "card" in res.stdout.lower():
+                nombre_pw = _obtener_info_fuente_pipewire()
+                if nombre_pw:
+                    return True, "arecord", nombre_pw
+                return (
+                    True,
+                    "arecord",
+                    "PipeWire / ALSA arecord (micrófono predeterminado del sistema)",
+                )
+        except Exception:
+            pass
+
     if SOUNDDEVICE_DISPONIBLE:
+        disp_efectivo = (
+            dispositivo
+            if dispositivo is not None
+            else _elegir_mejor_dispositivo_sounddevice()
+        )
         try:
             sd.check_input_settings(
-                device=dispositivo, channels=CANALES_DEFAULT, samplerate=sample_rate
+                device=disp_efectivo, channels=CANALES_DEFAULT, samplerate=sample_rate
             )
-            info_dev = sd.query_devices(device=dispositivo, kind="input")
+            info_dev = sd.query_devices(device=disp_efectivo, kind="input")
             nombre_dev = info_dev.get("name", "Dispositivo predeterminado")
             return True, "sounddevice", f"sounddevice ({nombre_dev})"
         except Exception as exc:
-            return (
-                False,
-                "sounddevice",
-                f"No se pudo acceder al micrófono mediante sounddevice: {exc}",
-            )
+            if not _arecord_disponible():
+                return (
+                    False,
+                    "sounddevice",
+                    f"No se pudo acceder al micrófono mediante sounddevice: {exc}",
+                )
 
-    # Si sounddevice no está instalado, verificar si arecord (ALSA en Linux) puede usarse
     if _arecord_disponible():
         try:
             res = subprocess.run(
@@ -391,7 +660,7 @@ def verificar_disponibilidad_microfono(
                 return (
                     True,
                     "arecord",
-                    "ALSA arecord (respaldo nativo Linux; se recomienda instalar sounddevice)",
+                    "PipeWire / ALSA arecord (micrófono del sistema)",
                 )
             return (
                 False,
@@ -480,57 +749,55 @@ def capturar_audio_microfono(
 ) -> np.ndarray:
     """
     Captura audio en mono (int16) durante `duracion_seg` segundos.
-    Utiliza `sounddevice` como motor principal (o `arecord` si sounddevice no está instalado).
-    Permite interrumpir con Ctrl+C limpiamente.
+    - En Linux con PipeWire/ALSA prioriza `arecord` cuando no se fuerza un ID de
+      dispositivo específico, asegurando usar el micrófono predeterminado real
+      del sistema (ej. micrófono digital interno DMIC) y el mismo motor con el
+      que se grabó el dataset, evitando entradas analógicas desconectadas en PortAudio.
+    - Si se usa `sounddevice` y se detecta una señal bloqueada en continua (jack
+      desconectado clavado en -1.0), recurre automáticamente a `arecord`.
     """
     num_muestras = int(round(duracion_seg * sample_rate))
 
+    usar_arecord_preferido = (
+        sys.platform.startswith("linux")
+        and dispositivo is None
+        and _arecord_disponible()
+    )
+    if usar_arecord_preferido:
+        return _capturar_con_arecord(num_muestras=num_muestras, sample_rate=sample_rate)
+
     if SOUNDDEVICE_DISPONIBLE:
+        disp_efectivo = (
+            dispositivo
+            if dispositivo is not None
+            else _elegir_mejor_dispositivo_sounddevice()
+        )
         grabacion = sd.rec(
             frames=num_muestras,
             samplerate=sample_rate,
             channels=CANALES_DEFAULT,
             dtype="int16",
-            device=dispositivo,
+            device=disp_efectivo,
         )
         try:
             sd.wait()
         except KeyboardInterrupt:
             sd.stop()
             raise
-        return np.asarray(grabacion, dtype=np.int16).reshape(-1)
+        audio_sd = np.asarray(grabacion, dtype=np.int16).reshape(-1)
+
+        if _es_captura_saturada_dc(audio_sd) and _arecord_disponible():
+            print(
+                "   [!] Aviso: El dispositivo PortAudio devolvió una señal bloqueada en DC "
+                "(entrada analógica sin micrófono). Reintentando captura vía PipeWire/arecord..."
+            )
+            return _capturar_con_arecord(
+                num_muestras=num_muestras, sample_rate=sample_rate
+            )
+        return audio_sd
 
     if _arecord_disponible():
-        fd_temp, ruta_temp = tempfile.mkstemp(prefix=".tmp_arecord_", suffix=".wav")
-        os.close(fd_temp)
-        try:
-            # Si duracion_seg es entero usamos -d, de lo contrario limitamos por muestras (-s)
-            cmd = [
-                "arecord",
-                "-q",
-                "-f",
-                "S16_LE",
-                "-c",
-                str(CANALES_DEFAULT),
-                "-r",
-                str(sample_rate),
-                "-t",
-                "wav",
-                "--samples",
-                str(num_muestras),
-                ruta_temp,
-            ]
-            subprocess.run(cmd, check=True)
-            with wave.open(ruta_temp, "rb") as wf:
-                raw_bytes = wf.readframes(wf.getnframes())
-                audio = np.frombuffer(raw_bytes, dtype=np.int16).copy()
-            return audio[:num_muestras]
-        finally:
-            if os.path.exists(ruta_temp):
-                try:
-                    os.remove(ruta_temp)
-                except OSError:
-                    pass
+        return _capturar_con_arecord(num_muestras=num_muestras, sample_rate=sample_rate)
 
     raise RuntimeError(
         "No hay ningún backend de captura de audio disponible. "
@@ -540,14 +807,15 @@ def capturar_audio_microfono(
 
 def calcular_metricas_senal(audio_int16: np.ndarray) -> Tuple[float, float]:
     """
-    Calcula el nivel RMS y el pico máximo normalizados en [0.0, 1.0]
-    para informar si el micrófono captó voz o silencio.
+    Calcula el nivel RMS y el pico máximo AC (descontando componente continua DC)
+    normalizados en [0.0, 1.0] para informar si el micrófono captó voz real o silencio.
     """
     if audio_int16.size == 0:
         return 0.0, 0.0
     norm = audio_int16.astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(np.square(norm))))
-    pico = float(np.max(np.abs(norm)))
+    norm_ac = norm - float(np.mean(norm))
+    rms = float(np.sqrt(np.mean(np.square(norm_ac))))
+    pico = float(np.max(np.abs(norm_ac)))
     return rms, pico
 
 
@@ -644,6 +912,9 @@ def escuchar_orden_en_vivo(
     )
     if not ok_mic:
         raise RuntimeError(f"Micrófono no disponible: {detalle_mic}")
+
+    if mostrar_mensajes:
+        print(f"\n[Micrófono activo: {detalle_mic}]", flush=True)
 
     if cuenta_regresiva > 0:
         ejecutar_cuenta_regresiva(cuenta_regresiva)
@@ -1413,24 +1684,27 @@ def _configurar_audio_menu(
 
     # 3. Selección de dispositivo de micrófono
     nuevo_disp = dispositivo_actual
-    dispositivos = listar_dispositivos_entrada()
-    if dispositivos:
-        print("\n Dispositivos de entrada (micrófono) detectados por sounddevice:")
-        print("   [D] Usar micrófono predeterminado del sistema")
-        for idx_dev, nombre_dev, ch_in in dispositivos:
-            marca = " [ACTUAL]" if dispositivo_actual == idx_dev else ""
-            print(f"   [{idx_dev}] {nombre_dev} ({ch_in} ch){marca}")
-        op_dev = input(
-            " Seleccioná ID de dispositivo, 'D' para predeterminado, o Enter para mantener: "
-        ).strip()
-        if op_dev.lower() == "d":
-            nuevo_disp = None
-        elif op_dev.isdigit():
-            id_elegido = int(op_dev)
-            if any(d[0] == id_elegido for d in dispositivos):
-                nuevo_disp = id_elegido
-            else:
-                print(" [!] ID no encontrado en la lista; se mantiene la configuración previa.")
+    if sys.platform.startswith("linux") and shutil.which("wpctl") is not None:
+        menu_cambiar_microfono_sistema()
+    else:
+        dispositivos = listar_dispositivos_entrada()
+        if dispositivos:
+            print("\n Dispositivos de entrada (micrófono) detectados por sounddevice:")
+            print("   [D] Usar micrófono predeterminado del sistema")
+            for idx_dev, nombre_dev, ch_in in dispositivos:
+                marca = " [ACTUAL]" if dispositivo_actual == idx_dev else ""
+                print(f"   [{idx_dev}] {nombre_dev} ({ch_in} ch){marca}")
+            op_dev = input(
+                " Seleccioná ID de dispositivo, 'D' para predeterminado, o Enter para mantener: "
+            ).strip()
+            if op_dev.lower() == "d":
+                nuevo_disp = None
+            elif op_dev.isdigit():
+                id_elegido = int(op_dev)
+                if any(d[0] == id_elegido for d in dispositivos):
+                    nuevo_disp = id_elegido
+                else:
+                    print(" [!] ID no encontrado en la lista; se mantiene la configuración previa.")
 
     print(
         f"\n [+] Configuración actualizada: {nuevo_sr} Hz | "

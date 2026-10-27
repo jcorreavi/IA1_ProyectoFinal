@@ -19,6 +19,7 @@ Funciones principales:
 
 import argparse
 import os
+import re
 import sys
 import warnings
 from typing import Dict, List, Optional, Tuple
@@ -826,13 +827,30 @@ def clasificar_senal_audio(
     if paquete_modelo is None:
         paquete_modelo = entrenar_o_cargar_modelo_voz(directorio_base=directorio_base)
 
-    rms_crudo, pico_crudo = gv.calcular_metricas_senal(
-        (np.asarray(senal) * 32768.0).astype(np.int16)
+    arr_i16 = (
+        np.clip(np.asarray(senal) * 32768.0, -32768, 32767).astype(np.int16)
         if np.max(np.abs(senal)) <= 1.5
         else np.asarray(senal, dtype=np.int16)
     )
+    rms_ac, pico_ac = gv.calcular_metricas_senal(arr_i16)
 
-    if pico_crudo < UMBRAL_PICO_SILENCIO:
+    if gv._es_captura_saturada_dc(arr_i16):
+        return {
+            "comando": "ERROR_MICROFONO",
+            "comando_mas_votado": None,
+            "confianza": 0.0,
+            "probabilidades": {c: 0.0 for c in COMANDOS_ORDEN},
+            "vecinos": [],
+            "es_valido": False,
+            "pico": pico_ac,
+            "rms": rms_ac,
+            "motivo": (
+                "La entrada de audio devolvió una señal bloqueada en continua (posible "
+                "jack analógico desconectado). Verificá el micrófono seleccionado."
+            ),
+        }
+
+    if pico_ac < UMBRAL_PICO_SILENCIO or rms_ac < 0.004:
         return {
             "comando": "SILENCIO",
             "comando_mas_votado": None,
@@ -840,9 +858,12 @@ def clasificar_senal_audio(
             "probabilidades": {c: 0.0 for c in COMANDOS_ORDEN},
             "vecinos": [],
             "es_valido": False,
-            "pico": pico_crudo,
-            "rms": rms_crudo,
-            "motivo": f"Nivel de audio demasiado bajo (pico={pico_crudo * 100:.1f}%). No se detectó voz.",
+            "pico": pico_ac,
+            "rms": rms_ac,
+            "motivo": (
+                f"Nivel de voz demasiado bajo (pico AC={pico_ac * 100:.1f}%, "
+                f"RMS={rms_ac * 100:.1f}%). No se detectó voz clara."
+            ),
         }
 
     vector_x = extraer_caracteristicas_voz(senal, sr=sr)
@@ -887,8 +908,8 @@ def clasificar_senal_audio(
         "probabilidades": mapa_probs,
         "vecinos": vecinos_info,
         "es_valido": es_valido,
-        "pico": pico_crudo,
-        "rms": rms_crudo,
+        "pico": pico_ac,
+        "rms": rms_ac,
         "vector_pca": coord_pca,
         "motivo": "OK" if es_valido else f"Confianza ({confianza * 100:.1f}%) menor al umbral ({umbral_confianza * 100:.1f}%).",
     }
@@ -974,7 +995,10 @@ def imprimir_resultado_prediccion(resultado: Dict[str, object]) -> None:
     else:
         cmd = resultado["comando"]
         conf = float(resultado["confianza"]) * 100.0
+        pico_pct = float(resultado.get("pico", 0.0)) * 100.0
+        rms_pct = float(resultado.get("rms", 0.0)) * 100.0
         print(f" >>> COMANDO RECONOCIDO: «{cmd.upper()}» (Confianza: {conf:.1f}%) <<<")
+        print(f"     Nivel de voz captado: pico AC = {pico_pct:.1f}% | energía RMS = {rms_pct:.1f}%")
 
     probs: Dict[str, float] = resultado.get("probabilidades", {})
     if any(probs.values()):
@@ -994,6 +1018,32 @@ def imprimir_resultado_prediccion(resultado: Dict[str, object]) -> None:
                 f"({v['persona']}: {os.path.basename(str(v['ruta_audio']))})"
             )
     print("=" * 72)
+
+
+def _generar_ruta_unica_prueba_vivo(comando_mostrado: str) -> str:
+    """
+    Genera una ruta correlativa única dentro de `resultados_voz/` para guardar
+    cada gráfico de prueba por micrófono sin sobrescribir los anteriores:
+    Ejemplo: resultados_voz/prueba_microfono_001_Reconocer.png
+    """
+    os.makedirs(DIRECTORIO_RESULTADOS_DEFAULT, exist_ok=True)
+    patron = re.compile(r"^prueba_microfono_(\d+)_", flags=re.IGNORECASE)
+    max_idx = 0
+    for nombre in os.listdir(DIRECTORIO_RESULTADOS_DEFAULT):
+        m = patron.match(nombre)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+
+    etiqueta_limpia = re.sub(r"[^A-Za-z0-9_\-]", "", str(comando_mostrado or "Audio"))
+    siguiente = max_idx + 1
+    while True:
+        candidata = os.path.join(
+            DIRECTORIO_RESULTADOS_DEFAULT,
+            f"prueba_microfono_{siguiente:03d}_{etiqueta_limpia}.png",
+        )
+        if not os.path.exists(candidata):
+            return candidata
+        siguiente += 1
 
 
 def graficar_prediccion_en_pca(
@@ -1085,8 +1135,9 @@ def graficar_prediccion_en_pca(
     ax_pca.grid(True, linestyle=":", alpha=0.5)
 
     plt.tight_layout()
-    fig.savefig(RUTA_GRAFICO_TEST_VIVO, dpi=160)
-    print(f"[+] Gráfico de la prueba guardado en: {os.path.abspath(RUTA_GRAFICO_TEST_VIVO)}")
+    ruta_salida = _generar_ruta_unica_prueba_vivo(str(cmd_mostrado))
+    fig.savefig(ruta_salida, dpi=160)
+    print(f"[+] Gráfico de la prueba guardado en: {os.path.abspath(ruta_salida)}")
 
     if mostrar_ventana:
         try:
@@ -1094,7 +1145,7 @@ def graficar_prediccion_en_pca(
         except Exception:
             pass
     plt.close(fig)
-    return RUTA_GRAFICO_TEST_VIVO
+    return ruta_salida
 
 
 # ==============================================================================
@@ -1177,6 +1228,7 @@ def menu_interactivo(
         print("   [2] Testear reconocimiento de voz en vivo con el MICRÓFONO")
         print("   [3] Probar el clasificador sobre un archivo .wav existente")
         print("   [4] Cambiar el valor de K (número de vecinos) y re-entrenar")
+        print("   [5] Ver / cambiar micrófono activo del sistema (Ubuntu PipeWire)")
         print("   [0] Salir")
         print("=" * 76)
 
@@ -1272,8 +1324,11 @@ def menu_interactivo(
             else:
                 print(" [!] Valor de K no válido.")
 
+        elif op == "5":
+            gv.menu_cambiar_microfono_sistema()
+
         else:
-            print(" [!] Opción no reconocida. Elegí entre 0 y 4.")
+            print(" [!] Opción no reconocida. Elegí entre 0 y 5.")
 
 
 # ==============================================================================

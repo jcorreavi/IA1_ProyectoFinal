@@ -8,3 +8,4 @@ Ingeniería Mecatrónica - UnCuyo
 
 # Anexo
 [Dataset generado por Agnuli](https://drive.google.com/drive/folders/142IiwQwoeMKl8vDTO7QRR49mcHZEGSLU?usp=sharing)
+Se pueden ver las librerías  utilizadas y dependencias de este proyecto en ```requirements.txt```
