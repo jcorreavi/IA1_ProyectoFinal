@@ -1052,6 +1052,8 @@ def graficar_prediccion_en_pca(
     sr: int,
     resultado: Dict[str, object],
     mostrar_ventana: bool = True,
+    ruta_salida_personalizada: Optional[str] = None,
+    silencioso: bool = False,
 ) -> str:
     """
     Genera una lámina visual mostrando:
@@ -1059,7 +1061,12 @@ def graficar_prediccion_en_pca(
       2. La ubicación exacta del audio recién pronunciado (estrella dorada ★) en el
          mapa PCA 2D respecto de los clústeres de «Reconocer», «Identificar» y «Salir».
     """
-    os.makedirs(DIRECTORIO_RESULTADOS_DEFAULT, exist_ok=True)
+    if ruta_salida_personalizada:
+        dir_dest = os.path.dirname(os.path.abspath(ruta_salida_personalizada))
+        if dir_dest:
+            os.makedirs(dir_dest, exist_ok=True)
+    else:
+        os.makedirs(DIRECTORIO_RESULTADOS_DEFAULT, exist_ok=True)
     fig, (ax_wav, ax_pca) = plt.subplots(1, 2, figsize=(14, 5.5), dpi=140)
 
     cmd_mostrado = resultado.get("comando_mas_votado") or resultado.get("comando")
@@ -1135,9 +1142,14 @@ def graficar_prediccion_en_pca(
     ax_pca.grid(True, linestyle=":", alpha=0.5)
 
     plt.tight_layout()
-    ruta_salida = _generar_ruta_unica_prueba_vivo(str(cmd_mostrado))
+    ruta_salida = (
+        ruta_salida_personalizada
+        if ruta_salida_personalizada
+        else _generar_ruta_unica_prueba_vivo(str(cmd_mostrado))
+    )
     fig.savefig(ruta_salida, dpi=160)
-    print(f"[+] Gráfico de la prueba guardado en: {os.path.abspath(ruta_salida)}")
+    if not silencioso:
+        print(f"[+] Gráfico de la prueba guardado en: {os.path.abspath(ruta_salida)}")
 
     if mostrar_ventana:
         try:
