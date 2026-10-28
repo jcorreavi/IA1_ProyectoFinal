@@ -90,17 +90,7 @@ def sincronizar_bandeja_agente(
     if not os.path.isdir(carpeta_origen):
         return len(listar_imagenes_en_carpeta(carpeta_bandeja))
 
-    copiadas = 0
-    # 1. Copiar imágenes directas si la carpeta origen es plana (ej. carpeta scrambled o anonimizada)
-    for elemento in sorted(os.listdir(carpeta_origen)):
-        ruta_elem = os.path.join(carpeta_origen, elemento)
-        if os.path.isfile(ruta_elem) and elemento.lower().endswith(prep.EXTENSIONES_VALIDAS):
-            destino_abs = os.path.join(carpeta_bandeja, elemento)
-            if not os.path.exists(destino_abs):
-                shutil.copy2(ruta_elem, destino_abs)
-                copiadas += 1
-
-    # 2. Copiar imágenes desde subcarpetas (Persona_1, Persona_2, intrusos, etc.)
+    esperados: Dict[str, str] = {}
     for sub in sorted(os.listdir(carpeta_origen)):
         ruta_sub = os.path.join(carpeta_origen, sub)
         if not os.path.isdir(ruta_sub) or sub.startswith("."):
@@ -117,11 +107,40 @@ def sincronizar_bandeja_agente(
                 nombre_dest = f"intruso_{nombre_limpio}"
             else:
                 nombre_dest = nombre
+            esperados[nombre_dest] = origen_abs
 
-            destino_abs = os.path.join(carpeta_bandeja, nombre_dest)
-            if not os.path.exists(destino_abs):
-                shutil.copy2(origen_abs, destino_abs)
-                copiadas += 1
+    copiadas = 0
+    for nombre_dest, origen_abs in esperados.items():
+        destino_abs = os.path.join(carpeta_bandeja, nombre_dest)
+        necesita_copia = not os.path.exists(destino_abs)
+        if not necesita_copia:
+            try:
+                necesita_copia = (
+                    os.path.getsize(origen_abs) != os.path.getsize(destino_abs)
+                    or abs(os.path.getmtime(origen_abs) - os.path.getmtime(destino_abs)) > 0.5
+                )
+            except OSError:
+                necesita_copia = True
+        if necesita_copia:
+            shutil.copy2(origen_abs, destino_abs)
+            copiadas += 1
+
+    # Si es la bandeja gestionada por defecto, limpiar copias huérfanas de archivos eliminados
+    if (
+        esperados
+        and os.path.abspath(carpeta_bandeja) == os.path.abspath(DIRECTORIO_BANDEJA_DEFAULT)
+    ):
+        for existente in os.listdir(carpeta_bandeja):
+            ruta_ex = os.path.join(carpeta_bandeja, existente)
+            if (
+                os.path.isfile(ruta_ex)
+                and existente.lower().endswith(prep.EXTENSIONES_VALIDAS)
+                and existente not in esperados
+            ):
+                try:
+                    os.remove(ruta_ex)
+                except OSError:
+                    pass
 
     return copiadas
 
@@ -851,12 +870,14 @@ class AgenteControlAccesoGUI:
             self._registrar_evento(f"Carpeta de huellas cambiada a: {elegida}")
 
     def _accion_sincronizar_bandeja(self) -> None:
+        self.modelo_huellas = rhk.entrenar_o_cargar_modelo_huellas()
         nuevas = sincronizar_bandeja_agente(
             DIRECTORIO_PRUEBA_ORIGEN, self.var_carpeta_bandeja.get()
         )
-        self._recargar_lista_huellas(seleccionar_primera=(self.ruta_huella_actual is None))
+        self._recargar_lista_huellas(seleccionar_primera=True)
+        tau = float(self.modelo_huellas["umbral_distancia"])
         self._registrar_evento(
-            f"Bandeja sincronizada desde '{DIRECTORIO_PRUEBA_ORIGEN}' ({nuevas} archivos nuevos copiados)."
+            f"Bandeja y modelo sincronizados ('{DIRECTORIO_PRUEBA_ORIGEN}', {nuevas} actualizados, τ={tau:.2f})."
         )
 
     def _elegir_carpeta_salidas(self) -> None:

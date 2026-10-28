@@ -674,9 +674,9 @@ def menu_interactivo():
     print("=" * 72)
 
     candidatos = [
-        ("dataset_huellas/Personas", "preprocesadas/dataset_huellas/Personas"),
-        ("huellas_prueba", "preprocesadas/huellas_prueba"),
-        ("dataset_huellas/Fingerprints", "preprocesadas/dataset_huellas/Fingerprints"),
+        ("dataset_huellas/Personas", "dataset_huellas_preprocesadas/Personas"),
+        ("huellas_prueba", "huellas_prueba_preprocesadas"),
+        ("dataset_huellas/Fingerprints", "dataset_huellas_preprocesadas/Fingerprints"),
     ]
     disponibles = [(e, s) for e, s in candidatos if os.path.isdir(e)]
 

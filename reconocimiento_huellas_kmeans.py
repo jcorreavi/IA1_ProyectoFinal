@@ -74,8 +74,9 @@ RUTA_GRAFICO_EXPERIMENTO = os.path.join(
 # para las 3 identidades sintéticas autorizadas. NO confundir con el parámetro K de
 # vecinos más cercanos del clasificador supervisado K-NN usado en el módulo de voz.
 K_CLUSTERS_DEFAULT = 3
-FACTOR_SIGMA_UMBRAL_DEFAULT = 4.25
-FACTOR_PISO_ESCALA = 0.20
+FACTOR_SIGMA_UMBRAL_DEFAULT = 4.35
+FACTOR_PISO_ESCALA = 0.075
+VERSION_EXTRACTOR_HUELLAS = 2
 
 MAPA_CARPETA_A_IDENTIDAD: Dict[str, str] = {
     "Persona_1": "Identidad Sintética #1",
@@ -110,22 +111,44 @@ MARCADORES_IDENTIDADES: Dict[str, str] = {
 
 class EscaladorEstandarRegularizado(BaseEstimator, TransformerMixin):
     """
-    Estandariza cada característica con media cero y varianza unitaria sobre el
-    conjunto de entrenamiento, imponiendo una cota inferior suave (`factor_piso`
-    de la desviación estándar mediana) para evitar que descriptores casi constantes
-    en las muestras limpias amplifiquen desproporcionadamente el ruido de prueba.
+    Estandariza centrando en la media de entrenamiento y escalando cada característica
+    según su dispersión local no supervisada entre los `m_vecinos` más cercanos dentro
+    de `X` (sin utilizar etiquetas `y`), con cota inferior física (`factor_piso`).
+
+    Esto preserva la resolución discriminante fina (ej. distinguir dos presillas del
+    mismo tipo) incluso cuando el conjunto autorizado combina patrones heterogéneos de
+    Galton-Henry / Vucetich (Arcos, Presillas Internas/Externas y Verticilos).
     """
 
-    def __init__(self, factor_piso: float = FACTOR_PISO_ESCALA):
+    def __init__(self, factor_piso: float = FACTOR_PISO_ESCALA, m_vecinos: int = 8):
         self.factor_piso = factor_piso
+        self.m_vecinos = m_vecinos
 
-    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> "EscaladorEstandarRegularizado":
-        self._scaler = StandardScaler()
-        self._scaler.fit(X)
-        mediana_std = float(np.median(self._scaler.scale_))
-        piso = max(1e-4, self.factor_piso * mediana_std)
-        self.mean_ = self._scaler.mean_.copy()
-        self.scale_ = np.maximum(self._scaler.scale_, piso)
+    def fit(
+        self, X: np.ndarray, y: Optional[np.ndarray] = None
+    ) -> "EscaladorEstandarRegularizado":
+        X_arr = np.asarray(X, dtype=np.float32)
+        n = X_arr.shape[0]
+        self.mean_ = np.mean(X_arr, axis=0)
+
+        sc0 = StandardScaler().fit(X_arr)
+        piso0 = max(1e-4, 0.20 * float(np.median(sc0.scale_)))
+        X0 = (X_arr - sc0.mean_) / np.maximum(sc0.scale_, piso0)
+
+        d2 = np.sum((X0[:, None, :] - X0[None, :, :]) ** 2, axis=2)
+        np.fill_diagonal(d2, np.inf)
+        m = min(self.m_vecinos, max(1, n - 1))
+        nn_idx = np.argsort(d2, axis=1)[:, :m]
+
+        diffs = X_arr[:, None, :] - X_arr[nn_idx]
+        local_rms = np.sqrt(np.mean(diffs**2, axis=(0, 1)) / 2.0)
+
+        pisos = np.full_like(local_rms, float(self.factor_piso))
+        # Piso suave mayor en los 3 indicadores enteros de presencia (carga_core, pres_L, pres_R)
+        for idx_disc in (0, 3, 12):
+            if idx_disc < len(pisos):
+                pisos[idx_disc] = max(pisos[idx_disc], 0.20)
+        self.scale_ = np.maximum(local_rms, pisos)
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
@@ -139,14 +162,28 @@ def estimar_marco_intrinseco_huella(
     """
     Estima el centro de masa `(cx, cy)`, la inclinación del eje mayor `phi_rot` y
     las dispersiones principales `(std_min, std_maj)` de la huella activa a partir
-    de su envolvente convexa, SIN recortar la imagen (preserva W x H íntegros).
+    de su envolvente convexa depurada morfológicamente, SIN recortar la imagen
+    (preserva W x H íntegros).
 
     Esto proporciona un sistema de referencia intrínseco al dedo que compensa las
-    traslaciones y rotaciones operativas al apoyar la huella en el sensor.
+    traslaciones y rotaciones operativas e ignora puntos aislados de ruido externo.
     """
-    mask = ((peso_textura > 0.22) | (imagen_binaria < 128)).astype(np.uint8)
+    cresta_limpia = cv2.morphologyEx(
+        (imagen_binaria < 128).astype(np.uint8) * 255,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    tex_limpia = cv2.morphologyEx(
+        (peso_textura > 0.28).astype(np.uint8) * 255,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+    )
+    mask = ((cresta_limpia > 0) | (tex_limpia > 0)).astype(np.uint8) * 255
+    mask_open = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
-    mask_closed = cv2.morphologyEx(mask * 255, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask_closed = cv2.morphologyEx(mask_open, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(
         mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -198,6 +235,24 @@ def transformar_a_coordenadas_intrinsecas(
     u = (dx * c + dy * s) / std_min
     v = (-dx * s + dy * c) / std_maj
     return u, v
+
+
+def transformar_intrinseco_a_pixel(
+    u: float,
+    v: float,
+    cx: float,
+    cy: float,
+    phi_rot: float,
+    std_min: float,
+    std_maj: float,
+) -> Tuple[float, float]:
+    """Transformación inversa: proyecta coordenadas canónicas `(u, v)` a píxeles `(x, y)`."""
+    c, s = np.cos(phi_rot), np.sin(phi_rot)
+    dx_can = u * std_min
+    dy_can = v * std_maj
+    x = cx + dx_can * c - dy_can * s
+    y = cy + dx_can * s + dy_can * c
+    return float(x), float(y)
 
 
 def contar_crestas_galton_henry(
@@ -285,35 +340,69 @@ def detectar_minucias_crossing_number(
 
 
 def detectar_singularidades_poincare(
-    imagen_suavizada: np.ndarray,
-    theta_denso: np.ndarray,
-    peso_textura: np.ndarray,
+    imagen_referencia: np.ndarray,
     hull_mask: np.ndarray,
-) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    cx: float,
+    cy: float,
+    phi_rot: float,
+    std_min: float,
+    std_maj: float,
+) -> Dict[str, object]:
     """
-    Localiza los puntos singulares principales de la huella dactilar evaluando la
-    integral discreta del Índice de Poincaré sobre el campo de orientación en bloques:
-      - Núcleo / Loop (Core): índice de Poincaré +1/2 (+180° en 2θ).
-      - Delta               : índice de Poincaré -1/2 (-180° en 2θ).
-    Incluye respaldo geométrico por máxima curvatura / mínima coherencia si un corte
-    severo atenúa alguna singularidad.
+    Localiza de manera general los puntos singulares de cualquier clase dactilar de
+    Galton-Henry / Vucetich mediante el Índice de Poincaré sobre el campo realzado:
+      - Arcos (Arch)            : 0 núcleos (`carga_core = 0`), 0 deltas (sin respaldos ruidosos).
+      - Presillas (Left / Right): 1 núcleo (`+1/2`) y 1 delta (`-1/2`, izquierdo o derecho).
+      - Verticilos (Whorl)      : 1 espiral `+1` o 2 núcleos (`carga_core = 2`) y 2 deltas
+                                  (`-1/2` izquierdo y `-1/2` derecho).
+    Incluye enmascarado previo del escalón de borde exterior y aniquilación topológica
+    de dipolos espurios de corta distancia (< 24 px) causados por ruido o cicatrices.
     """
-    base = cv2.GaussianBlur(imagen_suavizada.astype(np.float32), (5, 5), 1.0)
+    mask_hull_in = cv2.erode(
+        hull_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+        iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    vals_in = imagen_referencia[mask_hull_in > 0]
+    nivel_medio = float(np.mean(vals_in)) if len(vals_in) > 0 else 128.0
+    lienzo = np.where(
+        mask_hull_in > 0, imagen_referencia.astype(np.float32), nivel_medio
+    )
+
+    base = cv2.GaussianBlur(lienzo, (5, 5), 1.0)
     gx = cv2.Sobel(base, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(base, cv2.CV_32F, 0, 1, ksize=3)
+
+    mask_grad = (
+        cv2.erode(
+            hull_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+            iterations=1,
+            borderType=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        > 0
+    ).astype(np.float32)
+    gx = gx * mask_grad
+    gy = gy * mask_grad
+
     gxx = cv2.GaussianBlur(gx * gx, (31, 31), 6.5)
     gyy = cv2.GaussianBlur(gy * gy, (31, 31), 6.5)
     gxy = cv2.GaussianBlur(gx * gy, (31, 31), 6.5)
 
     step = 4
-    vx = cv2.GaussianBlur((gxx - gyy)[::step, ::step], (5, 5), 1.1)
-    vy = cv2.GaussianBlur((2.0 * gxy)[::step, ::step], (5, 5), 1.1)
+    vx = cv2.GaussianBlur((gxx - gyy)[::step, ::step], (7, 7), 1.5)
+    vy = cv2.GaussianBlur((2.0 * gxy)[::step, ::step], (7, 7), 1.5)
     theta_s = 0.5 * np.arctan2(vy, vx) + (np.pi / 2.0)
 
     interior = cv2.erode(
         hull_mask,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (33, 33)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)),
         iterations=1,
+        borderType=cv2.BORDER_CONSTANT,
+        borderValue=0,
     )[::step, ::step]
 
     offsets = [(-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1)]
@@ -327,37 +416,116 @@ def detectar_singularidades_poincare(
         suma += d
     poincare[1:-1, 1:-1] = suma / np.pi
 
-    yx_core = np.argwhere((np.abs(poincare - 1.0) < 0.28) & (interior > 0)) * step
-    yx_delta = np.argwhere((np.abs(poincare + 1.0) < 0.28) & (interior > 0)) * step
+    def _extraer_blobs(mask_bin: np.ndarray, signo: float) -> List[Dict[str, object]]:
+        num_labels, labels = cv2.connectedComponents(
+            mask_bin.astype(np.uint8), connectivity=8
+        )
+        blobs: List[Dict[str, object]] = []
+        for lbl in range(1, num_labels):
+            ys, xs = np.where(labels == lbl)
+            vals = signo * poincare[ys, xs]
+            fuerza = float(np.sum(vals))
+            pico = float(np.max(vals))
+            bx = float(np.average(xs, weights=vals) * step)
+            by = float(np.average(ys, weights=vals) * step)
+            blobs.append({"xy": (bx, by), "fuerza": fuerza, "pico": pico})
+        blobs.sort(key=lambda b: float(b["fuerza"]), reverse=True)
+        fusionados: List[Dict[str, object]] = []
+        for b in blobs:
+            agregado = False
+            b_xy = b["xy"]
+            for f in fusionados:
+                f_xy = f["xy"]
+                if np.hypot(b_xy[0] - f_xy[0], b_xy[1] - f_xy[1]) < 20.0:
+                    wt = float(f["fuerza"]) + float(b["fuerza"])
+                    f["xy"] = (
+                        (f_xy[0] * float(f["fuerza"]) + b_xy[0] * float(b["fuerza"])) / wt,
+                        (f_xy[1] * float(f["fuerza"]) + b_xy[1] * float(b["fuerza"])) / wt,
+                    )
+                    f["fuerza"] = wt
+                    f["pico"] = max(float(f["pico"]), float(b["pico"]))
+                    agregado = True
+                    break
+            if not agregado:
+                fusionados.append(dict(b))
+        return fusionados[:2]
 
-    if len(yx_core) > 0:
-        core_x = float(np.median(yx_core[:, 1]))
-        core_y = float(np.median(yx_core[:, 0]))
+    cores_blobs = _extraer_blobs((poincare > 0.70) & (interior > 0), signo=+1.0)
+    deltas_blobs = _extraer_blobs((poincare < -0.70) & (interior > 0), signo=-1.0)
+
+    # Aniquilación topológica de dipolos espurios (< 24 px entre +1/2 y -1/2)
+    cores_filtrados = []
+    deltas_usados = set()
+    for cb in cores_blobs:
+        es_dipolo = False
+        cb_xy = cb["xy"]
+        for j, db in enumerate(deltas_blobs):
+            if j in deltas_usados:
+                continue
+            db_xy = db["xy"]
+            if np.hypot(cb_xy[0] - db_xy[0], cb_xy[1] - db_xy[1]) < 24.0:
+                deltas_usados.add(j)
+                es_dipolo = True
+                break
+        if not es_dipolo:
+            cores_filtrados.append(cb)
+    deltas_blobs = [db for j, db in enumerate(deltas_blobs) if j not in deltas_usados]
+    cores_blobs = cores_filtrados
+
+    carga_core = 0
+    for cb in cores_blobs:
+        carga_core += 2 if float(cb["pico"]) > 1.50 else 1
+    carga_core = min(2, carga_core)
+
+    cores_xy: List[Tuple[float, float]] = [cb["xy"] for cb in cores_blobs]
+    if cores_xy:
+        tiene_core = True
+        pesos_c = [float(cb["fuerza"]) for cb in cores_blobs]
+        core_x = float(np.average([p[0] for p in cores_xy], weights=pesos_c))
+        core_y = float(np.average([p[1] for p in cores_xy], weights=pesos_c))
     else:
-        grad_c = cv2.Laplacian(
-            np.cos(2.0 * theta_denso).astype(np.float32), cv2.CV_32F, ksize=5
-        )
-        grad_s = cv2.Laplacian(
-            np.sin(2.0 * theta_denso).astype(np.float32), cv2.CV_32F, ksize=5
-        )
-        curv = (grad_c**2 + grad_s**2) * (
-            cv2.erode(hull_mask, np.ones((35, 35), np.uint8)) > 0
-        )
-        iy, ix = np.unravel_index(np.argmax(curv), curv.shape)
-        core_x, core_y = float(ix), float(iy)
+        tiene_core = False
+        core_x, core_y = float(cx), float(cy)
 
-    if len(yx_delta) > 0:
-        delta_x = float(np.median(yx_delta[:, 1]))
-        delta_y = float(np.median(yx_delta[:, 0]))
+    deltas_info: List[Dict[str, object]] = []
+    for db in deltas_blobs:
+        dx, dy = db["xy"]
+        du, dv = transformar_a_coordenadas_intrinsecas(
+            dx, dy, cx, cy, phi_rot, std_min, std_maj
+        )
+        deltas_info.append(
+            {
+                "xy": (float(dx), float(dy)),
+                "uv": (float(du), float(dv)),
+                "fuerza": float(db["fuerza"]),
+            }
+        )
+    deltas_info.sort(key=lambda d: d["uv"][0])
+
+    n_deltas = len(deltas_info)
+    if not tiene_core and n_deltas == 0:
+        tipo_topo = "Arco"
+    elif n_deltas >= 2 or carga_core >= 2:
+        tipo_topo = "Verticilo"
+    elif n_deltas == 1:
+        du0 = float(deltas_info[0]["uv"][0])
+        if du0 < -0.18:
+            tipo_topo = "Presilla Derecha"
+        elif du0 > 0.18:
+            tipo_topo = "Presilla Izquierda"
+        else:
+            tipo_topo = "Arco en Tienda"
     else:
-        coh_inv = (1.0 - peso_textura) * (
-            cv2.erode(hull_mask, np.ones((29, 29), np.uint8)) > 0
-        )
-        coh_inv[: int(core_y), :] = 0
-        iy, ix = np.unravel_index(np.argmax(coh_inv), coh_inv.shape)
-        delta_x, delta_y = float(ix), float(iy)
+        tipo_topo = "Presilla"
 
-    return (core_x, core_y), (delta_x, delta_y)
+    return {
+        "tiene_core": tiene_core,
+        "carga_core": float(carga_core),
+        "core_xy": (core_x, core_y),
+        "cores_xy": cores_xy,
+        "deltas": deltas_info,
+        "tipo_topologico": tipo_topo,
+    }
 
 
 def extraer_caracteristicas_huella(
@@ -365,15 +533,18 @@ def extraer_caracteristicas_huella(
     retornar_info_geometrica: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, object]]]:
     """
-    Representa una huella preprocesada mediante un vector discriminante de 41
-    características biométricas invariantes a traslación y rotación:
-      - [0..9]   (10): Topología de singularidades (Poincaré Core/Delta en marco
-                       intrínseco, vector Core->Delta, distancia escalada, ángulo
-                       intrínseco cos/sin y conteo de crestas Galton-Henry).
-      - [10..33] (24): Campo de orientación intrínseco de crestas (cos 2(θ-φ),
-                       sin 2(θ-φ)) ponderado por coherencia en grilla elíptica 4x3.
-      - [34..36]  (3): Descriptores de textura direccional de Gabor por franjas.
-      - [37..40]  (4): Centroide intrínseco de bifurcaciones (CN=3 en esqueleto) y
+    Representa una huella preprocesada mediante un vector discriminante de 55
+    características biométricas invariantes a traslación y rotación, compatible con
+    cualquier familia dactilar (Arcos, Presillas Internas/Externas y Verticilos):
+      - [0..2]   (3) : Carga topológica de núcleo (0/1/2) y coordenadas `(core_u, core_v)`.
+      - [3..20]  (18): Canales laterales suaves Izquierdo (`u < 0`) y Derecho (`u > 0`)
+                       para Deltas (presencia, posición intrínseca, vector Core->Delta,
+                       distancia escalada, cos/sin angular y conteo de crestas Galton-Henry).
+      - [21..23] (3) : Perfiles longitudinales de densidad de crestas (`u = -0.45, 0, +0.45`).
+      - [24..47] (24): Campo de orientación intrínseco de crestas (`cos 2(θ-φ)`,
+                       `sin 2(θ-φ)`) ponderado por coherencia en grilla elíptica 4x3.
+      - [48..50] (3) : Descriptores de textura direccional de Gabor por franjas.
+      - [51..54] (4) : Centroide intrínseco de bifurcaciones (`CN=3` en esqueleto) y
                        primeros 2 Momentos Invariantes de Hu del mapa de singularidad.
     """
     img_suav = etapas["sin_ruido"]
@@ -387,40 +558,101 @@ def extraer_caracteristicas_huella(
     )
     escala_ref = float(np.sqrt(std_min * std_maj))
 
-    # 1. Singularidades de Poincaré y conteo de crestas Galton-Henry
-    (core_x, core_y), (delta_x, delta_y) = detectar_singularidades_poincare(
-        img_suav, theta_denso, peso_tex, hull
+    # 1. Singularidades de Poincaré multi-clase y conteo de crestas Galton-Henry
+    sing = detectar_singularidades_poincare(
+        img_gabor, hull, cx, cy, phi_rot, std_min, std_maj
     )
-    core_u, core_v = transformar_a_coordenadas_intrinsecas(
-        core_x, core_y, cx, cy, phi_rot, std_min, std_maj
-    )
-    delta_u, delta_v = transformar_a_coordenadas_intrinsecas(
-        delta_x, delta_y, cx, cy, phi_rot, std_min, std_maj
-    )
+    core_x, core_y = sing["core_xy"]
+    tiene_core = bool(sing["tiene_core"])
+    if tiene_core:
+        cu_raw, cv_raw = transformar_a_coordenadas_intrinsecas(
+            core_x, core_y, cx, cy, phi_rot, std_min, std_maj
+        )
+        core_u, core_v = float(cu_raw), float(cv_raw)
+    else:
+        core_u, core_v = 0.0, 0.0
 
-    du_cd = float(delta_u - core_u)
-    dv_cd = float(delta_v - core_v)
-    dist_cd_norm = float(np.hypot(delta_x - core_x, delta_y - core_y)) / (
-        escala_ref + 1e-6
-    )
-    ang_cd = float(np.arctan2(dv_cd, du_cd))
-    crestas_raw = contar_crestas_galton_henry(
-        img_gabor, img_bin, (core_x, core_y), (delta_x, delta_y)
-    )
-    crestas_norm = crestas_raw / 15.0
+    pres_L = dLu = dLv = duL = dvL = distL = cosL = sinL = crL = 0.0
+    pres_R = dRu = dRv = duR = dvR = distR = cosR = sinR = crR = 0.0
+    crestas_por_delta: List[int] = []
+    deltas_xy_lista: List[Tuple[float, float]] = []
+
+    for d_item in sing["deltas"]:
+        dx, dy = d_item["xy"]
+        du, dv = d_item["uv"]
+        deltas_xy_lista.append((dx, dy))
+
+        # Partición suave de la unidad centrada en u = 0 (evita saltos discretos en Arcos en Tienda)
+        z = float(np.clip(du / 0.08, -30.0, 30.0))
+        w_R = 1.0 / (1.0 + np.exp(-z))
+        w_L = 1.0 - w_R
+
+        rel_u = du - core_u
+        rel_v = dv - core_v
+        ang = float(np.arctan2(rel_v, rel_u))
+        dist_n = float(np.hypot(dx - core_x, dy - core_y)) / (escala_ref + 1e-6)
+        cr_raw = (
+            contar_crestas_galton_henry(img_gabor, img_bin, (core_x, core_y), (dx, dy))
+            if tiene_core
+            else 0.0
+        )
+        crestas_por_delta.append(int(round(cr_raw)))
+        cr_n = cr_raw / 15.0
+
+        pres_L += w_L
+        dLu += w_L * du
+        dLv += w_L * dv
+        duL += w_L * rel_u
+        dvL += w_L * rel_v
+        distL += w_L * dist_n
+        cosL += w_L * float(np.cos(ang))
+        sinL += w_L * float(np.sin(ang))
+        crL += w_L * cr_n
+
+        pres_R += w_R
+        dRu += w_R * du
+        dRv += w_R * dv
+        duR += w_R * rel_u
+        dvR += w_R * rel_v
+        distR += w_R * dist_n
+        cosR += w_R * float(np.cos(ang))
+        sinR += w_R * float(np.sin(ang))
+        crR += w_R * cr_n
 
     caracteristicas: List[float] = [
-        float(core_u),
-        float(core_v),
-        float(delta_u),
-        float(delta_v),
-        du_cd,
-        dv_cd,
-        dist_cd_norm,
-        float(np.cos(ang_cd)),
-        float(np.sin(ang_cd)),
-        crestas_norm,
+        float(sing["carga_core"]),
+        core_u,
+        core_v,
+        pres_L,
+        dLu,
+        dLv,
+        duL,
+        dvL,
+        distL,
+        cosL,
+        sinL,
+        crL,
+        pres_R,
+        dRu,
+        dRv,
+        duR,
+        dvR,
+        distR,
+        cosR,
+        sinR,
+        crR,
     ]
+
+    # Perfiles longitudinales de densidad de crestas (discriminan incluso Arcos sin singularidades)
+    for u_col in (-0.45, 0.0, 0.45):
+        p_ini = transformar_intrinseco_a_pixel(
+            u_col, -0.85, cx, cy, phi_rot, std_min, std_maj
+        )
+        p_fin = transformar_intrinseco_a_pixel(
+            u_col, +0.85, cx, cy, phi_rot, std_min, std_maj
+        )
+        dens = contar_crestas_galton_henry(img_gabor, img_bin, p_ini, p_fin) / 22.0
+        caracteristicas.append(float(dens))
 
     # 2. Orientación local de crestas en grilla canónica 4x3 alineada al dedo
     h, w = img_suav.shape[:2]
@@ -484,7 +716,15 @@ def extraer_caracteristicas_huella(
         caracteristicas.extend([0.0, 0.0])
 
     int_soft = cv2.GaussianBlur(
-        (cv2.erode(hull, np.ones((25, 25), np.uint8)) > 0).astype(np.float32),
+        (
+            cv2.erode(
+                hull,
+                np.ones((25, 25), np.uint8),
+                borderType=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            > 0
+        ).astype(np.float32),
         (15, 15),
         4.0,
     )
@@ -498,15 +738,23 @@ def extraer_caracteristicas_huella(
     if not retornar_info_geometrica:
         return vector
 
+    delta_principal_xy = deltas_xy_lista[0] if deltas_xy_lista else (cx, cy)
+    conteo_total = int(sum(crestas_por_delta))
     info_geo: Dict[str, object] = {
         "cx": cx,
         "cy": cy,
         "phi_grados": float(np.degrees(phi_rot)),
         "std_min": std_min,
         "std_maj": std_maj,
+        "tiene_core": tiene_core,
+        "carga_core": int(round(float(sing["carga_core"]))),
         "core_xy": (core_x, core_y),
-        "delta_xy": (delta_x, delta_y),
-        "conteo_crestas": int(round(crestas_raw)),
+        "cores_xy": sing["cores_xy"],
+        "delta_xy": delta_principal_xy,
+        "deltas_xy": deltas_xy_lista,
+        "crestas_por_delta": crestas_por_delta,
+        "conteo_crestas": conteo_total,
+        "tipo_topologico": sing["tipo_topologico"],
         "num_terminaciones": int(np.sum(term_map > 0)),
         "num_bifurcaciones": int(np.sum(bif_map > 0)),
     }
@@ -664,19 +912,37 @@ def entrenar_modelo_huellas(
                 id_ganadora, "Persona_1"
             )
 
-    # Distancias euclídeas de cada muestra de entrenamiento a su centroide asignado
-    dist_matriz_train = kmeans.transform(X_train_std)
+    # Distancias euclídeas equiparadas por compacidad radial no supervisada de cada clúster
+    dist_matriz_raw = kmeans.transform(X_train_std)
+    radios_c = np.ones(k_clusters, dtype=np.float32)
+    dist_propia_raw = dist_matriz_raw[np.arange(len(clusters_train)), clusters_train]
+    for ci in range(k_clusters):
+        vals_ci = dist_propia_raw[clusters_train == ci]
+        if len(vals_ci) >= 3:
+            radios_c[ci] = float(np.percentile(vals_ci, 75))
+    radio_medio = float(np.mean(radios_c))
+    escala_cluster = np.maximum(radios_c / max(radio_medio, 1e-4), 0.65).astype(np.float32)
+
+    dist_matriz_train = dist_matriz_raw / escala_cluster[None, :]
     dist_min_train = np.min(dist_matriz_train, axis=1)
 
     media_dist_train = float(np.mean(dist_min_train))
     std_dist_train = float(np.std(dist_min_train))
+    mediana_dist_train = float(np.median(dist_min_train))
+    sigma_mad_train = float(
+        1.4826 * np.median(np.abs(dist_min_train - mediana_dist_train))
+    )
     max_dist_train = float(np.max(dist_min_train))
     p95_dist_train = float(np.percentile(dist_min_train, 95))
 
-    # Regla experimental de umbral sobre el conjunto de entrenamiento autorizado:
-    # tau = media + 4.25 * sigma (cubre holgadamente variaciones operativas de Anguli/distorsión
-    # rechazando huellas ajenas cuyo patrón direccional/singular cae fuera de la hiperesfera)
-    umbral_distancia = float(media_dist_train + factor_sigma_umbral * std_dist_train)
+    # Calibración estadística robusta (MAD + P95) sobre el conjunto autorizado:
+    # evita que una sola impresión distorsionada infle artificialmente el umbral τ
+    umbral_distancia = float(
+        max(
+            mediana_dist_train + factor_sigma_umbral * sigma_mad_train,
+            p95_dist_train * 1.15,
+        )
+    )
 
     # Ajuste de Análisis por Componentes Principales (PCA) sobre X_train_std
     n_comp_max = min(15, X_train_std.shape[0], X_train_std.shape[1])
@@ -685,12 +951,21 @@ def entrenar_modelo_huellas(
     centroides_pca = pca_modelo.transform(kmeans.cluster_centers_)
 
     firmas_archivos = [
-        ( os.path.basename(r), os.path.getsize(r) ) for r in rutas_train if os.path.isfile(r)
+        (
+            str(carpetas_train[idx_r]),
+            os.path.basename(r),
+            os.path.getsize(r),
+            int(os.path.getmtime(r)),
+        )
+        for idx_r, r in enumerate(rutas_train)
+        if os.path.isfile(r)
     ]
 
     paquete_modelo: Dict[str, object] = {
+        "version_extractor": VERSION_EXTRACTOR_HUELLAS,
         "escalador": escalador,
         "kmeans": kmeans,
+        "escala_cluster": escala_cluster,
         "k_clusters": k_clusters,
         "mapa_cluster_a_identidad": mapa_cluster_a_identidad,
         "mapa_cluster_a_carpeta": mapa_cluster_a_carpeta,
@@ -698,7 +973,9 @@ def entrenar_modelo_huellas(
         "factor_sigma_umbral": factor_sigma_umbral,
         "estadisticas_dist_train": {
             "media": media_dist_train,
+            "mediana": mediana_dist_train,
             "std": std_dist_train,
+            "sigma_mad": sigma_mad_train,
             "p95": p95_dist_train,
             "max": max_dist_train,
             "min": float(np.min(dist_min_train)),
@@ -741,7 +1018,12 @@ def entrenar_o_cargar_modelo_huellas(
         if m[1] in MAPA_CARPETA_A_IDENTIDAD
     ]
     firmas_actuales = [
-        (os.path.basename(m[0]), os.path.getsize(m[0]))
+        (
+            str(m[1]),
+            os.path.basename(m[0]),
+            os.path.getsize(m[0]),
+            int(os.path.getmtime(m[0])),
+        )
         for m in muestras_actuales
         if os.path.isfile(m[0])
     ]
@@ -759,7 +1041,8 @@ def entrenar_o_cargar_modelo_huellas(
                 )
             paquete = joblib.load(RUTA_MODELO_CACHE)
             if (
-                paquete.get("k_clusters") == k_clusters
+                paquete.get("version_extractor") == VERSION_EXTRACTOR_HUELLAS
+                and paquete.get("k_clusters") == k_clusters
                 and paquete.get("firmas_entrenamiento") == firmas_actuales
             ):
                 return paquete
@@ -783,8 +1066,8 @@ def clasificar_vector_huella(
     umbral_personalizado: Optional[float] = None,
 ) -> Dict[str, object]:
     """
-    Evalúa un vector de 41 características frente a los centroides K-Means y aplica
-    el criterio de aceptación/rechazo por umbral de distancia euclídea.
+    Evalúa un vector de 55 características frente a los centroides K-Means y aplica
+    el criterio de aceptación/rechazo por umbral de distancia euclídea equiparada.
     """
     escalador: EscaladorEstandarRegularizado = paquete_modelo["escalador"]
     kmeans: KMeans = paquete_modelo["kmeans"]
@@ -799,7 +1082,11 @@ def clasificar_vector_huella(
 
     x_2d = np.asarray(vector_x, dtype=np.float32).reshape(1, -1)
     x_std = escalador.transform(x_2d)
-    distancias = kmeans.transform(x_std)[0]
+    escala_cluster = np.asarray(
+        paquete_modelo.get("escala_cluster", np.ones(kmeans.n_clusters, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    distancias = (kmeans.transform(x_std)[0]) / escala_cluster
 
     cluster_ganador = int(np.argmin(distancias))
     distancia_min = float(distancias[cluster_ganador])
@@ -935,61 +1222,103 @@ def _dibujar_elipse_confianza(
 def crear_imagen_huella_anotada(resultado_huella: Dict[str, object]) -> np.ndarray:
     """
     Genera una imagen BGR (mismas dimensiones 275x400 px) superponiendo sobre la
-    huella realzada con Gabor el núcleo (Core), el Delta y la línea de conteo de
-    crestas Galton-Henry para inspección visual en la interfaz o en el informe.
+    huella realzada con Gabor las singularidades realmente presentes según la clase
+    dactilar:
+      - Arco     : centroide intrínseco (+) e indicación "Arco (sin Delta)".
+      - Presilla : Core, Delta y segmento de conteo de crestas Galton-Henry.
+      - Verticilo: Core(s), ambos Deltas (Izq./Der.) y ambos conteos de crestas.
     """
     gabor = resultado_huella["etapas"]["gabor"]
     vis = cv2.cvtColor(gabor, cv2.COLOR_GRAY2BGR)
     info = resultado_huella["info_geometrica"]
 
     cx, cy = int(round(info["cx"])), int(round(info["cy"]))
+    tiene_core = bool(info.get("tiene_core", True))
     core_x, core_y = (
         int(round(info["core_xy"][0])),
         int(round(info["core_xy"][1])),
     )
-    delta_x, delta_y = (
-        int(round(info["delta_xy"][0])),
-        int(round(info["delta_xy"][1])),
+    deltas_xy: List[Tuple[float, float]] = list(
+        info.get("deltas_xy") or ([info["delta_xy"]] if tiene_core else [])
     )
 
-    # Línea de conteo Galton-Henry entre Core y Delta
-    cv2.line(vis, (core_x, core_y), (delta_x, delta_y), (0, 165, 255), 2, cv2.LINE_AA)
     # Centroide del óvalo (+)
     cv2.drawMarker(
         vis, (cx, cy), (180, 105, 30), cv2.MARKER_CROSS, 12, 1, cv2.LINE_AA
     )
-    # Núcleo / Core (círculo verde/cian)
-    cv2.circle(vis, (core_x, core_y), 7, (0, 200, 0), 2, cv2.LINE_AA)
-    cv2.putText(
-        vis,
-        "Core",
-        (core_x + 9, max(16, core_y - 4)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (0, 140, 0),
-        1,
-        cv2.LINE_AA,
-    )
-    # Delta (triángulo/marcador rojo)
-    cv2.drawMarker(
-        vis,
-        (delta_x, delta_y),
-        (20, 30, 220),
-        cv2.MARKER_TRIANGLE_UP,
-        13,
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        vis,
-        "Delta",
-        (min(vis.shape[1] - 48, max(4, delta_x + 8)), min(vis.shape[0] - 8, delta_y + 14)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (20, 30, 220),
-        1,
-        cv2.LINE_AA,
-    )
+
+    # Líneas de conteo Galton-Henry hacia cada Delta detectado
+    if tiene_core and deltas_xy:
+        for dx_f, dy_f in deltas_xy:
+            dx_i, dy_i = int(round(dx_f)), int(round(dy_f))
+            cv2.line(vis, (core_x, core_y), (dx_i, dy_i), (0, 165, 255), 2, cv2.LINE_AA)
+
+    # Dibujar Core(s) solo si la topología presenta núcleo real
+    if tiene_core:
+        cores_lista = list(info.get("cores_xy") or [(core_x, core_y)])
+        for cxf, cyf in cores_lista:
+            cv2.circle(
+                vis,
+                (int(round(cxf)), int(round(cyf))),
+                6,
+                (0, 200, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        cv2.circle(vis, (core_x, core_y), 7, (0, 180, 0), 2, cv2.LINE_AA)
+        cv2.putText(
+            vis,
+            "Core",
+            (min(vis.shape[1] - 46, max(4, core_x + 9)), max(16, core_y - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 140, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # Dibujar cada Delta real detectado (0 en Arco, 1 en Presilla, 2 en Verticilo)
+    for idx_d, (dx_f, dy_f) in enumerate(deltas_xy):
+        delta_x, delta_y = int(round(dx_f)), int(round(dy_f))
+        cv2.drawMarker(
+            vis,
+            (delta_x, delta_y),
+            (20, 30, 220),
+            cv2.MARKER_TRIANGLE_UP,
+            13,
+            2,
+            cv2.LINE_AA,
+        )
+        etiq_d = (
+            "Delta"
+            if len(deltas_xy) == 1
+            else ("Delta Izq." if idx_d == 0 else "Delta Der.")
+        )
+        cv2.putText(
+            vis,
+            etiq_d,
+            (
+                min(vis.shape[1] - 72, max(4, delta_x - 16 if idx_d > 0 else delta_x + 6)),
+                min(vis.shape[0] - 8, delta_y + 15),
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (20, 30, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+    if not tiene_core and not deltas_xy:
+        cv2.putText(
+            vis,
+            "Tipo: Arco (sin Core/Delta)",
+            (16, vis.shape[0] - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.46,
+            (150, 60, 10),
+            1,
+            cv2.LINE_AA,
+        )
     return vis
 
 
@@ -1048,15 +1377,22 @@ def graficar_evaluacion_huella(
         color=color_titulo,
     )
 
-    # Panel 1: Imagen anotada con Core, Delta y línea Galton-Henry
+    # Panel 1: Imagen anotada según clase topológica (Arco, Presilla o Verticilo)
     vis_bgr = crear_imagen_huella_anotada(resultado_huella)
     vis_rgb = cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
     info = resultado_huella["info_geometrica"]
+    tipo_topo = str(info.get("tipo_topologico", "Huella"))
+    cr_lista = list(info.get("crestas_por_delta") or [])
+    if len(cr_lista) >= 2:
+        sub_topo = f"{tipo_topo} | Crestas C-D: {cr_lista[0]}/{cr_lista[1]}"
+    elif len(cr_lista) == 1:
+        sub_topo = f"{tipo_topo} | Crestas C-D: {cr_lista[0]}"
+    else:
+        sub_topo = f"{tipo_topo} | 0 Deltas"
     ax_img.imshow(vis_rgb)
     ax_img.set_title(
-        f"1. Topología Detectada\n(Crestas Core-Delta: {info['conteo_crestas']} | "
-        f"Eje: {info['phi_grados']:+.1f}°)",
-        fontsize=10.5,
+        f"1. Topología Detectada\n({sub_topo} | Eje: {info['phi_grados']:+.1f}°)",
+        fontsize=10.2,
         fontweight="bold",
     )
     ax_img.axis("off")
@@ -1246,7 +1582,11 @@ def analizar_y_graficar_dataset_huellas(
     X_test_std = escalador.transform(X_test)
     X_test_pca = pca_modelo.transform(X_test_std)
 
-    dists_test_mat = kmeans.transform(X_test_std)
+    escala_cluster = np.asarray(
+        paquete.get("escala_cluster", np.ones(kmeans.n_clusters, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    dists_test_mat = kmeans.transform(X_test_std) / escala_cluster[None, :]
     dist_min_test = np.min(dists_test_mat, axis=1)
     clusters_test = np.argmin(dists_test_mat, axis=1)
 
@@ -1291,7 +1631,10 @@ def analizar_y_graficar_dataset_huellas(
     print(f" - Dimensión del vector dactilar     : {X_train_std.shape[1]} características intrínsecas")
     print(f" - Agrupamiento no supervisado       : K-Means (k = {k_clusters} centroides)")
     print(f" - Pureza de clústeres entrenamiento : {pureza_train * 100:.2f}% | Silueta: {silueta_train:.4f}")
-    print(f" - Umbral de distancia calibrado (τ) : {umbral:.3f} (media_train + {paquete['factor_sigma_umbral']}·σ)")
+    print(
+        f" - Umbral de distancia calibrado (τ) : {umbral:.3f} "
+        f"(mediana + {paquete['factor_sigma_umbral']}·σ_MAD / P95)"
+    )
     print(f" - Exactitud global en Prueba        : {exactitud_global_test * 100:.2f}% ({int(round(exactitud_global_test * len(y_test_real)))}/{len(y_test_real)})")
     print(f" - Falso Rechazo (FRR autorizados)   : {frr * 100:.2f}% | Falsa Aceptación (FAR intrusos): {far * 100:.2f}%")
     print(f" - Varianza explicada PCA            : 2D = {var_2d:.1f}% | 3D = {var_3d:.1f}%")
@@ -1442,8 +1785,21 @@ def analizar_y_graficar_dataset_huellas(
 
     # --- PANEL 3: Matriz de Confusión en Prueba (4x4 con Intrusos) ---
     ax3 = fig.add_subplot(2, 2, 3)
-    im_mc = ax3.imshow(matriz_conf, interpolation="nearest", cmap=plt.cm.Blues)
-    fig.colorbar(im_mc, ax=ax3, fraction=0.046, pad=0.04)
+    # Normalización por fila (Recall / Sensibilidad) para que el color refleje fielmente la
+    # tasa de acierto (0% a 100%) y no se distorsione por diferencias en el conteo de muestras.
+    totales_por_fila = np.maximum(1, np.sum(matriz_conf, axis=1, keepdims=True))
+    matriz_conf_pct = (matriz_conf.astype(np.float32) / totales_por_fila) * 100.0
+
+    im_mc = ax3.imshow(
+        matriz_conf_pct,
+        interpolation="nearest",
+        cmap=plt.cm.Blues,
+        vmin=0.0,
+        vmax=100.0,
+    )
+    cbar_mc = fig.colorbar(im_mc, ax=ax3, fraction=0.046, pad=0.04)
+    cbar_mc.set_label("Tasa de Acierto por Clase (%)", fontsize=8.5)
+
     ax3.set_title(
         f"3. Matriz de Confusión en Prueba (Exactitud: {exactitud_global_test * 100:.1f}%)",
         fontsize=11,
@@ -1457,13 +1813,13 @@ def analizar_y_graficar_dataset_huellas(
     ax3.set_ylabel("Identidad Real")
     ax3.set_xlabel("Decisión del Sistema (K-Means + Umbral)")
 
-    umbral_txt = max(1.0, matriz_conf.max() / 2.0)
     for i in range(matriz_conf.shape[0]):
         tot_f = max(1, int(np.sum(matriz_conf[i])))
         for j in range(matriz_conf.shape[1]):
             val = int(matriz_conf[i, j])
             pct = (val / tot_f) * 100.0
-            c_txt = "white" if val > umbral_txt else "black"
+            # Contraste de texto: blanco para celdas de fondo oscuro (> 50% de intensidad), negro para el resto
+            c_txt = "white" if pct > 50.0 else "black"
             ax3.text(
                 j,
                 i,

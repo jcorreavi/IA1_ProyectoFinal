@@ -8,8 +8,8 @@ __pycache__/
 # Dataset (muy pesado para GitHub)
 dataset_huellas/socofing/
 dataset_huellas/Personas/
-huellas_dataset/socofing/
-huellas_dataset/Personas/
+dataset_huellas_preprocesadas/
+huellas_prueba_preprocesadas/
 huellas_prueba/
 huellas_prueba_scramble/
 preprocesadas/
@@ -21,3 +21,6 @@ Informe/
 # Bandeja copiada y salidas por sesión del agente
 bandeja_agente/
 salidas_agente/
+
+# Copias de seguridad
+backup*/
