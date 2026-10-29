@@ -86,6 +86,12 @@ def sincronizar_bandeja_agente(
     Nota: el clasificador K-Means evalúa exclusivamente la matriz de píxeles de la imagen
     y jamás inspecciona el nombre del archivo.
     """
+    # Seguridad: NUNCA copiar si el destino es la misma carpeta origen o una subcarpeta de ella
+    ruta_orig_abs = os.path.abspath(carpeta_origen)
+    ruta_dest_abs = os.path.abspath(carpeta_bandeja)
+    if ruta_orig_abs == ruta_dest_abs or ruta_dest_abs.startswith(ruta_orig_abs + os.sep):
+        return 0
+
     os.makedirs(carpeta_bandeja, exist_ok=True)
     if not os.path.isdir(carpeta_origen):
         return len(listar_imagenes_en_carpeta(carpeta_bandeja))
@@ -96,18 +102,21 @@ def sincronizar_bandeja_agente(
         if not os.path.isdir(ruta_sub) or sub.startswith("."):
             continue
 
-        es_intruso = "intrus" in sub.lower() or "no_aut" in sub.lower()
         for nombre in sorted(os.listdir(ruta_sub)):
             if not nombre.lower().endswith(prep.EXTENSIONES_VALIDAS):
                 continue
             origen_abs = os.path.join(ruta_sub, nombre)
-            # Evitar colisiones si en `intrusos/` hay nombres genéricos como `1.jpg`
-            if es_intruso and not nombre.lower().startswith("intrus"):
-                nombre_limpio = nombre.replace(" ", "_")
-                nombre_dest = f"intruso_{nombre_limpio}"
-            else:
-                nombre_dest = nombre
-            esperados[nombre_dest] = origen_abs
+            base_name, ext = os.path.splitext(nombre)
+            base_limpia = base_name.strip()
+
+            candidato = f"{base_limpia}{ext.lower()}"
+            contador = 2
+            # Si ya se usó este nombre en la bandeja, resolver colisión con sufijo numérico neutral (_2, _3, ...)
+            while candidato in esperados:
+                candidato = f"{base_limpia}_{contador}{ext.lower()}"
+                contador += 1
+
+            esperados[candidato] = origen_abs
 
     copiadas = 0
     for nombre_dest, origen_abs in esperados.items():
@@ -273,6 +282,7 @@ class AgenteControlAccesoGUI:
         self.pil_mosaico_etapas: Optional[Image.Image] = None
         self.pil_grafico_huella: Optional[Image.Image] = None
         self.pil_grafico_voz: Optional[Image.Image] = None
+        self.pil_mosaico_voz: Optional[Image.Image] = None
         self._photo_refs: Dict[str, ImageTk.PhotoImage] = {}
 
         # Control de captura de micrófono no bloqueante
@@ -415,20 +425,33 @@ class AgenteControlAccesoGUI:
             activebackground="#cbd5e1",
             relief="flat",
             font=("DejaVu Sans", 8, "bold"),
-            padx=8,
+            padx=6,
             pady=4,
             cursor="hand2",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
         tk.Button(
             btn_bar_izq,
-            text="Sincronizar",
-            command=self._accion_sincronizar_bandeja,
+            text="Refrescar",
+            command=self._accion_refrescar_lista,
             bg="#e2e8f0",
             fg="#0f172a",
             activebackground="#cbd5e1",
             relief="flat",
             font=("DejaVu Sans", 8),
-            padx=8,
+            padx=6,
+            pady=4,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 3))
+        tk.Button(
+            btn_bar_izq,
+            text="Bandeja base",
+            command=self._accion_restaurar_bandeja_defecto,
+            bg="#f1f5f9",
+            fg="#475569",
+            activebackground="#e2e8f0",
+            relief="flat",
+            font=("DejaVu Sans", 8),
+            padx=5,
             pady=4,
             cursor="hand2",
         ).pack(side=tk.LEFT)
@@ -508,11 +531,13 @@ class AgenteControlAccesoGUI:
         self.tab_etapas = tk.Frame(self.notebook, bg="#f8fafc")
         self.tab_pca_huella = tk.Frame(self.notebook, bg="#f8fafc")
         self.tab_pca_voz = tk.Frame(self.notebook, bg="#f8fafc")
+        self.tab_mosaico_voz = tk.Frame(self.notebook, bg="#f8fafc")
 
         self.notebook.add(self.tab_principal, text=" Huella / Previsualización ")
-        self.notebook.add(self.tab_etapas, text=" Etapas Preprocesamiento (0-5) ")
+        self.notebook.add(self.tab_etapas, text=" Etapas Huella (0-5) ")
         self.notebook.add(self.tab_pca_huella, text=" K-Means + PCA (Huella) ")
         self.notebook.add(self.tab_pca_voz, text=" K-NN + PCA (Última Voz) ")
+        self.notebook.add(self.tab_mosaico_voz, text=" Etapas Audio (Última Voz) ")
 
         self.lbl_canvas_principal = tk.Label(
             self.tab_principal,
@@ -549,6 +574,15 @@ class AgenteControlAccesoGUI:
             font=("DejaVu Sans", 10),
         )
         self.lbl_canvas_pca_voz.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        self.lbl_canvas_mosaico_voz = tk.Label(
+            self.tab_mosaico_voz,
+            bg="#f8fafc",
+            fg="#64748b",
+            text="Pronunciá un comando por micrófono para visualizar las 6 etapas de procesamiento del audio.",
+            font=("DejaVu Sans", 10),
+        )
+        self.lbl_canvas_mosaico_voz.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
         self.tab_principal.bind("<Configure>", lambda _e: self._redibujar_pestanas())
         self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._redibujar_pestanas())
@@ -869,15 +903,32 @@ class AgenteControlAccesoGUI:
             self._recargar_lista_huellas(seleccionar_primera=True)
             self._registrar_evento(f"Carpeta de huellas cambiada a: {elegida}")
 
-    def _accion_sincronizar_bandeja(self) -> None:
+    def _accion_refrescar_lista(self) -> None:
+        """Vuelve a leer los archivos de la carpeta actual sin copiar ni modificar nada."""
+        self._recargar_lista_huellas(seleccionar_primera=False)
+        nombre_c = os.path.basename(self.var_carpeta_bandeja.get()) or self.var_carpeta_bandeja.get()
+        self._registrar_evento(
+            f"Lista de huellas actualizada ({len(self.archivos_bandeja)} muestras en '{nombre_c}')."
+        )
+
+    def _accion_restaurar_bandeja_defecto(self) -> None:
+        """Restaura la carpeta por defecto 'bandeja_agente/' con las muestras de prueba."""
+        resp = messagebox.askyesno(
+            "Restaurar bandeja de prueba",
+            "¿Deseás volver a la carpeta 'bandeja_agente/' y sincronizarla con todas las huellas de prueba desde 'huellas_prueba/'?",
+            parent=self.root,
+        )
+        if not resp:
+            return
+        self.var_carpeta_bandeja.set(os.path.abspath(DIRECTORIO_BANDEJA_DEFAULT))
         self.modelo_huellas = rhk.entrenar_o_cargar_modelo_huellas()
         nuevas = sincronizar_bandeja_agente(
-            DIRECTORIO_PRUEBA_ORIGEN, self.var_carpeta_bandeja.get()
+            DIRECTORIO_PRUEBA_ORIGEN, DIRECTORIO_BANDEJA_DEFAULT
         )
         self._recargar_lista_huellas(seleccionar_primera=True)
         tau = float(self.modelo_huellas["umbral_distancia"])
         self._registrar_evento(
-            f"Bandeja y modelo sincronizados ('{DIRECTORIO_PRUEBA_ORIGEN}', {nuevas} actualizados, τ={tau:.2f})."
+            f"Bandeja restaurada ('{DIRECTORIO_PRUEBA_ORIGEN}', {nuevas} actualizados, τ={tau:.2f})."
         )
 
     def _elegir_carpeta_salidas(self) -> None:
@@ -968,6 +1019,7 @@ class AgenteControlAccesoGUI:
             ("etapas", self.pil_mosaico_etapas, self.lbl_canvas_etapas),
             ("pca_h", self.pil_grafico_huella, self.lbl_canvas_pca_huella),
             ("pca_v", self.pil_grafico_voz, self.lbl_canvas_pca_voz),
+            ("mos_v", self.pil_mosaico_voz, self.lbl_canvas_mosaico_voz),
         ]
         for clave, img_pil, widget in pares:
             if img_pil is None:
@@ -1094,7 +1146,7 @@ class AgenteControlAccesoGUI:
             pb["value"] = pct
             lbl_p.config(text=f"{pct:5.1f}%")
 
-        # Renderizar en memoria (o en carpeta de análisis) el gráfico PCA de esta voz si hubo señal
+        # Renderizar en memoria el gráfico PCA y el mosaico de etapas de esta voz si hubo señal
         if res_voz.get("vector_pca") is not None:
             fd_tmp, ruta_tmp_voz = tempfile.mkstemp(suffix="_voz_pca.png")
             os.close(fd_tmp)
@@ -1110,10 +1162,31 @@ class AgenteControlAccesoGUI:
                 )
                 with Image.open(ruta_tmp_voz) as im_v:
                     self.pil_grafico_voz = im_v.convert("RGB")
-                self._redibujar_pestanas()
             finally:
                 if os.path.exists(ruta_tmp_voz):
                     os.remove(ruta_tmp_voz)
+
+        if senal_float is not None and len(senal_float) > 0:
+            fd_mos, ruta_tmp_mos = tempfile.mkstemp(suffix="_voz_mosaico.png")
+            os.close(fd_mos)
+            try:
+                cmd_lbl = str(res_voz.get("comando_mas_votado") or res_voz.get("comando") or "")
+                rv.crear_mosaico_etapas_audio(
+                    senal=senal_float,
+                    sr=sr,
+                    ruta_guardado=ruta_tmp_mos,
+                    nombre_archivo=f"orden_{cmd_lbl}.wav" if cmd_lbl else "orden_capturada.wav",
+                    etiqueta=cmd_lbl,
+                    mostrar_ventana=False,
+                    silencioso=True,
+                )
+                with Image.open(ruta_tmp_mos) as im_m:
+                    self.pil_mosaico_voz = im_m.convert("RGB")
+            finally:
+                if os.path.exists(ruta_tmp_mos):
+                    os.remove(ruta_tmp_mos)
+
+        self._redibujar_pestanas()
 
         if not res_voz["es_valido"]:
             estado_v = str(res_voz["comando"])
@@ -1223,12 +1296,19 @@ class AgenteControlAccesoGUI:
             )
         else:
             self.estado_huella = self.ESTADO_RECONOCIDO_RECHAZADO
-            self._actualizar_cartel_acceso(
-                titulo="NO AUTORIZADO",
-                subtitulo=(
+            motivos = res_h.get("motivo_rechazo", [])
+            if motivos:
+                subtitulo_rechazo = f"Acceso denegado: {motivos[0]}."
+                detalle_log = f" ({motivos[0]})"
+            else:
+                subtitulo_rechazo = (
                     f"Acceso denegado: Distancia al centroide más cercano ({dist_min:.2f}) "
                     f"supera el umbral τ = {umbral:.2f}."
-                ),
+                )
+                detalle_log = f" (distancia={dist_min:.2f} > τ={umbral:.2f})"
+            self._actualizar_cartel_acceso(
+                titulo="NO AUTORIZADO",
+                subtitulo=subtitulo_rechazo,
                 bg="#fee2e2",
                 fg="#991b1b",
             )
@@ -1236,8 +1316,7 @@ class AgenteControlAccesoGUI:
                 text="NO AUTORIZADO (Muestra rechazada)", fg="#b91c1c"
             )
             self._registrar_evento(
-                f"Evaluación «Reconocer» en '{res_h['nombre_archivo']}': NO AUTORIZADO "
-                f"(distancia={dist_min:.2f} > τ={umbral:.2f})."
+                f"Evaluación «Reconocer» en '{res_h['nombre_archivo']}': NO AUTORIZADO{detalle_log}."
             )
 
         self._redibujar_pestanas()
@@ -1300,12 +1379,18 @@ class AgenteControlAccesoGUI:
                 self._guardar_artefactos_orden_voz("Identificar", res_voz)
 
         elif self.estado_huella == self.ESTADO_RECONOCIDO_RECHAZADO:
-            self._actualizar_cartel_acceso(
-                titulo="NO AUTORIZADO",
-                subtitulo=(
+            motivos = res_h.get("motivo_rechazo", [])
+            sub_id = (
+                f"No se puede identificar: {motivos[0]}."
+                if motivos
+                else (
                     "No se puede identificar: la huella fue rechazada en «Reconocer» "
                     f"(distancia {dist_min:.2f} > τ = {umbral:.2f}, identidad desconocida)."
-                ),
+                )
+            )
+            self._actualizar_cartel_acceso(
+                titulo="NO AUTORIZADO",
+                subtitulo=sub_id,
                 bg="#fee2e2",
                 fg="#991b1b",
             )
@@ -1461,6 +1546,23 @@ class AgenteControlAccesoGUI:
                 resultado=res_voz,
                 mostrar_ventana=False,
                 ruta_salida_personalizada=ruta_png_voz,
+                silencioso=True,
+            )
+
+        # Mosaico comparativo de las 6 etapas de procesamiento del audio
+        ruta_mosaico_voz = os.path.join(
+            carp, f"03_voz_{idx_v:02d}_{etiqueta_orden}_mosaico_etapas.png"
+        )
+        if self.pil_mosaico_voz is not None:
+            self.pil_mosaico_voz.save(ruta_mosaico_voz, format="PNG")
+        elif senal is not None:
+            rv.crear_mosaico_etapas_audio(
+                senal=senal,
+                sr=sr,
+                ruta_guardado=ruta_mosaico_voz,
+                nombre_archivo=f"03_voz_{idx_v:02d}_{etiqueta_orden}.wav",
+                etiqueta=etiqueta_orden,
+                mostrar_ventana=False,
                 silencioso=True,
             )
 

@@ -15,6 +15,8 @@ Funciones principales:
    curva de exactitud según K) y proyección por Componentes Principales (PCA 2D y 3D).
 4. Reconocimiento de comandos en vivo por micrófono («Reconocer», «Identificar»,
    «Salir») exportable en una sola función para el Agente final.
+5. Generación de mosaicos comparativos de etapas de preprocesamiento y extracción
+   acústica (análogo al mosaico de huellas dactilares para el informe final).
 """
 
 import argparse
@@ -23,6 +25,9 @@ import re
 import sys
 import warnings
 from typing import Dict, List, Optional, Tuple
+
+if "MPLCONFIGDIR" not in os.environ:
+    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-ia1"
 
 import joblib
 import librosa
@@ -59,6 +64,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 DIRECTORIO_DATASET_DEFAULT = gv.DIRECTORIO_DATASET_DEFAULT
 DIRECTORIO_RESULTADOS_DEFAULT = "resultados_voz"
+CARPETA_COMPARATIVAS_VOZ = os.path.join(
+    DIRECTORIO_RESULTADOS_DEFAULT, "comparativas_etapas"
+)
 RUTA_MODELO_CACHE = os.path.join(
     DIRECTORIO_RESULTADOS_DEFAULT, "modelo_knn_voz.joblib"
 )
@@ -1160,6 +1168,375 @@ def graficar_prediccion_en_pca(
     return ruta_salida
 
 
+def _generar_ruta_unica_mosaico_vivo(comando_mostrado: str) -> str:
+    """
+    Genera una ruta correlativa única dentro de `resultados_voz/comparativas_etapas/`
+    para guardar cada mosaico de etapas capturado en vivo sin sobrescribir los anteriores:
+    Ejemplo: resultados_voz/comparativas_etapas/mosaico_microfono_001_Reconocer.png
+    """
+    os.makedirs(CARPETA_COMPARATIVAS_VOZ, exist_ok=True)
+    patron = re.compile(r"^mosaico_microfono_(\d+)_", flags=re.IGNORECASE)
+    max_idx = 0
+    for nombre in os.listdir(CARPETA_COMPARATIVAS_VOZ):
+        m = patron.match(nombre)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+
+    etiqueta_limpia = re.sub(r"[^A-Za-z0-9_\-]", "", str(comando_mostrado or "Audio"))
+    siguiente = max_idx + 1
+    while True:
+        candidata = os.path.join(
+            CARPETA_COMPARATIVAS_VOZ,
+            f"mosaico_microfono_{siguiente:03d}_{etiqueta_limpia}.png",
+        )
+        if not os.path.exists(candidata):
+            return candidata
+        siguiente += 1
+
+
+def crear_mosaico_etapas_audio(
+    senal: np.ndarray,
+    sr: int = gv.SAMPLE_RATE_DEFAULT,
+    ruta_guardado: Optional[str] = None,
+    nombre_archivo: str = "",
+    etiqueta: str = "",
+    mostrar_ventana: bool = False,
+    silencioso: bool = False,
+) -> str:
+    """
+    Construye y guarda una lámina comparativa en mosaico (3 filas x 2 columnas)
+    que ilustra paso a paso cada una de las 6 etapas del procesamiento acústico
+    y extracción espectro-temporal (análogo a `crear_mosaico_comparativo` en huellas):
+
+      Panel 1: Señal Original Cruda (onda en el dominio del tiempo con offset DC y ruido ambiental).
+      Panel 2: Filtrado Pasa-Banda Butterworth (120 Hz a 7200 Hz).
+      Panel 3: Detección de Actividad de Voz (VAD adaptativo por envolvente RMS, umbral y segmento activo).
+      Panel 4: Palabra Recortada y Normalizada (segmento activo s_voz con energía eficaz RMS = 1.0).
+      Panel 5: Pre-énfasis de Alta Frecuencia (coef = 0.97) y Partición Fonética en 6 Bloques Temporales (B1..B6).
+      Panel 6: Espectrograma MFCC con Normalización de Media Cepstral (CMN) y delimitación de bloques.
+
+    Retorna:
+        Ruta absoluta del archivo PNG guardado.
+    """
+    s_cruda = np.asarray(senal, dtype=np.float32).reshape(-1)
+    if s_cruda.size == 0:
+        s_cruda = np.zeros(int(0.5 * sr), dtype=np.float32)
+
+    # 1. Quitar offset DC
+    dc_offset = float(np.mean(s_cruda))
+    s_centrada = s_cruda - dc_offset
+
+    # 2. Filtrado pasa-banda Butterworth
+    b_bp, a_bp = _construir_filtro_pasabanda(sr=sr)
+    if len(s_centrada) > 32:
+        s_filtrada = filtfilt(b_bp, a_bp, s_centrada).astype(np.float32)
+    else:
+        s_filtrada = s_centrada
+
+    # 3. VAD por envolvente RMS
+    frame_len = int(0.025 * sr)
+    hop_len = int(0.010 * sr)
+    rms_env = librosa.feature.rms(
+        y=s_filtrada, frame_length=frame_len, hop_length=hop_len
+    )[0]
+    t_env = np.arange(len(rms_env)) * (hop_len / float(sr))
+
+    piso_ruido = float(np.percentile(rms_env, 15))
+    pico_max = float(np.max(rms_env))
+    umbral_vad = piso_ruido + 0.18 * (pico_max - piso_ruido)
+
+    frames_activos = np.where(rms_env >= umbral_vad)[0]
+    if len(frames_activos) >= 4:
+        ini_frame = max(0, int(frames_activos[0]) - 2)
+        fin_frame = min(len(rms_env), int(frames_activos[-1]) + 3)
+        muestra_ini = ini_frame * hop_len
+        muestra_fin = min(len(s_filtrada), fin_frame * hop_len)
+        s_voz = s_filtrada[muestra_ini:muestra_fin]
+    else:
+        muestra_ini, muestra_fin = 0, len(s_filtrada)
+        s_voz = s_filtrada
+
+    if len(s_voz) < int(0.15 * sr):
+        muestra_ini, muestra_fin = 0, len(s_filtrada)
+        s_voz = s_filtrada
+
+    # 4. Normalización RMS
+    rms_voz = float(np.sqrt(np.mean(np.square(s_voz)))) + 1e-8
+    s_voz_norm = (s_voz / rms_voz).astype(np.float32)
+
+    # 5. Pre-énfasis
+    s_pre = librosa.effects.preemphasis(s_voz_norm, coef=0.97)
+
+    # 6. MFCC con CMN
+    mfcc = librosa.feature.mfcc(
+        y=s_pre,
+        sr=sr,
+        n_mfcc=13,
+        n_mels=32,
+        n_fft=512,
+        hop_length=hop_len,
+        fmin=120,
+        fmax=7200,
+    )
+    mfcc_cmn = mfcc - np.mean(mfcc, axis=1, keepdims=True)
+
+    # Partición en 6 bloques temporales
+    n_frames = mfcc.shape[1]
+    bloques = np.array_split(np.arange(n_frames), N_SEGMENTOS_TEMPORALES)
+
+    # Construcción de la lámina
+    fig, axs = plt.subplots(3, 2, figsize=(15.5, 10.5), dpi=140)
+
+    sub_titulo = "Mosaico Comparativo de Etapas de Procesamiento de Audio"
+    detalles = []
+    if nombre_archivo:
+        detalles.append(f"Archivo: {nombre_archivo}")
+    if etiqueta:
+        detalles.append(f"Comando: «{etiqueta}»")
+    detalles.append(f"Fs: {sr} Hz ({sr / 1000.0:.1f} kHz)")
+    detalles.append(f"Pre-énfasis: 0.97")
+    detalles.append(f"Bloques temporales: {N_SEGMENTOS_TEMPORALES}")
+
+    fig.suptitle(
+        f"{sub_titulo}\n{' | '.join(detalles)}",
+        fontsize=12,
+        fontweight="bold",
+    )
+
+    t_cruda = np.arange(len(s_cruda)) / float(sr)
+
+    # Panel 1: Onda cruda
+    ax1 = axs[0, 0]
+    ax1.plot(t_cruda, s_cruda, color="#455a64", linewidth=0.85, label="Señal capturada")
+    ax1.axhline(
+        dc_offset,
+        color="#c62828",
+        linestyle=":",
+        linewidth=1.1,
+        label=f"Offset DC ({dc_offset:+.4f})",
+    )
+    ax1.set_title("1. Señal Original Cruda (Dominio del Tiempo)", fontweight="bold", fontsize=10.5)
+    ax1.set_ylabel("Amplitud cruda", fontsize=9)
+    ax1.set_xlabel("Tiempo (segundos)", fontsize=9)
+    ax1.grid(True, linestyle=":", alpha=0.5)
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # Panel 2: Señal filtrada
+    ax2 = axs[0, 1]
+    ax2.plot(t_cruda, s_filtrada, color="#0288d1", linewidth=0.85, label="Filtro pasa-banda")
+    ax2.set_title(
+        "2. Filtrado Pasa-Banda Butterworth (120 Hz – 7200 Hz)",
+        fontweight="bold",
+        fontsize=10.5,
+    )
+    ax2.set_ylabel("Amplitud filtrada", fontsize=9)
+    ax2.set_xlabel("Tiempo (segundos)", fontsize=9)
+    ax2.grid(True, linestyle=":", alpha=0.5)
+    ax2.legend(loc="upper right", fontsize=8)
+
+    # Panel 3: VAD
+    ax3 = axs[1, 0]
+    ax3.plot(t_env, rms_env, color="#e65100", linewidth=1.5, label="Envolvente RMS (25 ms)")
+    ax3.axhline(
+        umbral_vad,
+        color="#d32f2f",
+        linestyle="--",
+        linewidth=1.2,
+        label=f"Umbral VAD adaptativo ({umbral_vad:.3f})",
+    )
+    t_ini_s = muestra_ini / float(sr)
+    t_fin_s = muestra_fin / float(sr)
+    ax3.axvspan(
+        t_ini_s,
+        t_fin_s,
+        color="#2ca02c",
+        alpha=0.25,
+        label=f"Voz activa detectada ({t_ini_s:.2f}s – {t_fin_s:.2f}s)",
+    )
+    ax3.set_title(
+        "3. Detección de Actividad de Voz (VAD por Envolvente RMS)",
+        fontweight="bold",
+        fontsize=10.5,
+    )
+    ax3.set_ylabel("Energía RMS", fontsize=9)
+    ax3.set_xlabel("Tiempo (segundos)", fontsize=9)
+    ax3.grid(True, linestyle=":", alpha=0.5)
+    ax3.legend(loc="upper right", fontsize=8)
+
+    # Panel 4: Palabra recortada y normalizada
+    ax4 = axs[1, 1]
+    t_voz = np.arange(len(s_voz_norm)) / float(sr)
+    dur_util_s = len(s_voz_norm) / float(sr)
+    ax4.plot(t_voz, s_voz_norm, color="#2e7d32", linewidth=0.85, label="Palabra activa")
+    ax4.set_title(
+        f"4. Palabra Recortada y Normalizada (RMS = 1.0, Duración = {dur_util_s:.3f} s)",
+        fontweight="bold",
+        fontsize=10.5,
+    )
+    ax4.set_ylabel("Amplitud normalizada", fontsize=9)
+    ax4.set_xlabel("Tiempo relativo de la palabra (segundos)", fontsize=9)
+    ax4.grid(True, linestyle=":", alpha=0.5)
+    ax4.legend(loc="upper right", fontsize=8)
+
+    # Panel 5: Pre-énfasis y Bloques temporales
+    ax5 = axs[2, 0]
+    ax5.plot(t_voz, s_pre, color="#7b1fa2", linewidth=0.85, label="Pre-énfasis (coef=0.97)")
+    colores_bloques = ["#e3f2fd", "#f3e5f5", "#e8f5e9", "#fff3e0", "#fce4ec", "#e0f2f1"]
+    max_pre = float(np.max(np.abs(s_pre))) if len(s_pre) > 0 else 1.0
+    for idx_b, b in enumerate(bloques):
+        t_b_ini = (b[0] * hop_len) / float(sr)
+        t_b_fin = ((b[-1] + 1) * hop_len) / float(sr)
+        ax5.axvspan(
+            t_b_ini,
+            t_b_fin,
+            color=colores_bloques[idx_b % len(colores_bloques)],
+            alpha=0.40,
+        )
+        if idx_b > 0:
+            ax5.axvline(t_b_ini, color="#8e24aa", linestyle="--", linewidth=0.9, alpha=0.7)
+        ax5.text(
+            (t_b_ini + t_b_fin) / 2.0,
+            max_pre * 0.80,
+            f"B{idx_b + 1}",
+            ha="center",
+            va="center",
+            fontsize=8.5,
+            fontweight="bold",
+            color="#4a148c",
+            bbox=dict(
+                boxstyle="round,pad=0.2",
+                facecolor="white",
+                edgecolor="#8e24aa",
+                alpha=0.85,
+                linewidth=0.7,
+            ),
+        )
+    ax5.set_title(
+        f"5. Filtro Pre-énfasis y Partición Fonética en {N_SEGMENTOS_TEMPORALES} Bloques Temporales",
+        fontweight="bold",
+        fontsize=10.5,
+    )
+    ax5.set_ylabel("Amplitud pre-énfasis", fontsize=9)
+    ax5.set_xlabel("Tiempo relativo de la palabra (segundos)", fontsize=9)
+    ax5.grid(True, linestyle=":", alpha=0.5)
+    ax5.legend(loc="lower right", fontsize=8)
+
+    # Panel 6: MFCC con CMN
+    ax6 = axs[2, 1]
+    im = ax6.imshow(
+        mfcc_cmn,
+        origin="lower",
+        aspect="auto",
+        cmap="magma",
+        extent=[0, dur_util_s, 0.5, 13.5],
+    )
+    for idx_b, b in enumerate(bloques[:-1]):
+        t_b_div = ((b[-1] + 1) * hop_len) / float(sr)
+        ax6.axvline(t_b_div, color="white", linestyle="--", linewidth=1.0, alpha=0.85)
+    ax6.set_title(
+        "6. Espectrograma MFCC con Normalización CMN (13 Coeficientes)",
+        fontweight="bold",
+        fontsize=10.5,
+    )
+    ax6.set_ylabel("Coeficiente Cepstral (1 a 13)", fontsize=9)
+    ax6.set_xlabel("Tiempo relativo de la palabra (segundos)", fontsize=9)
+    ax6.set_yticks(np.arange(1, 14, 2))
+    cbar = fig.colorbar(im, ax=ax6, pad=0.02)
+    cbar.set_label("Energía cepstral (CMN)", fontsize=8)
+
+    plt.tight_layout()
+
+    if not ruta_guardado:
+        os.makedirs(CARPETA_COMPARATIVAS_VOZ, exist_ok=True)
+        nombre_limpio = os.path.splitext(os.path.basename(nombre_archivo or "audio"))[0]
+        nombre_limpio = re.sub(r"[^A-Za-z0-9_\-]", "_", nombre_limpio)
+        ruta_guardado = os.path.join(
+            CARPETA_COMPARATIVAS_VOZ, f"{nombre_limpio}_mosaico_etapas.png"
+        )
+    else:
+        dir_dest = os.path.dirname(os.path.abspath(ruta_guardado))
+        if dir_dest:
+            os.makedirs(dir_dest, exist_ok=True)
+
+    fig.savefig(ruta_guardado, dpi=150)
+    if not silencioso:
+        print(f"[+] Mosaico comparativo de etapas guardado en: {os.path.abspath(ruta_guardado)}")
+
+    if mostrar_ventana:
+        try:
+            plt.show()
+        except Exception:
+            pass
+    plt.close(fig)
+    return os.path.abspath(ruta_guardado)
+
+
+def generar_mosaicos_dataset(
+    directorio_base: str = DIRECTORIO_DATASET_DEFAULT,
+    carpeta_salida: str = CARPETA_COMPARATIVAS_VOZ,
+    max_por_clase: Optional[int] = 1,
+    mostrar_ventana: bool = False,
+) -> List[str]:
+    """
+    Genera mosaicos comparativos de las etapas de procesamiento para los audios
+    del dataset. Si `max_por_clase` es un entero (ej: 1 o 2), genera esa cantidad
+    de ejemplos representativos por cada comando («Reconocer», «Identificar», «Salir»).
+    Si es None, procesa el dataset completo.
+    """
+    registros = gv.leer_registros_metadata(directorio_base)
+    if not registros:
+        print(f"[!] No hay grabaciones registradas en '{directorio_base}/metadata.csv'.")
+        return []
+
+    os.makedirs(carpeta_salida, exist_ok=True)
+    seleccionados: List[Dict[str, str]] = []
+
+    if max_por_clase is not None and max_por_clase > 0:
+        conteo_clase: Dict[str, int] = {cmd: 0 for cmd in COMANDOS_ORDEN}
+        for reg in registros:
+            cmd = reg.get("comando", "")
+            if cmd in conteo_clase and conteo_clase[cmd] < max_por_clase:
+                seleccionados.append(reg)
+                conteo_clase[cmd] += 1
+    else:
+        seleccionados = list(registros)
+
+    print(
+        f"\n[*] Generando {len(seleccionados)} mosaicos comparativos de etapas de audio "
+        f"en '{carpeta_salida}/'..."
+    )
+    rutas_generadas: List[str] = []
+    for idx, reg in enumerate(seleccionados, start=1):
+        rel_path = reg.get("ruta_audio", "")
+        ruta_wav = gv.resolver_ruta_en_disco(directorio_base, rel_path)
+        if not os.path.isfile(ruta_wav):
+            continue
+        senal, sr = gv.leer_wav_mono(ruta_wav, normalizar_float=True)
+        nombre_base = os.path.basename(ruta_wav)
+        nombre_sin_ext = os.path.splitext(nombre_base)[0]
+        ruta_salida = os.path.join(carpeta_salida, f"{nombre_sin_ext}_mosaico_etapas.png")
+
+        cmd = reg.get("comando", "")
+        persona = reg.get("persona", "")
+        etiqueta_desc = f"{cmd} ({persona})" if persona else cmd
+
+        print(f" [{idx}/{len(seleccionados)}] Procesando '{nombre_base}' -> «{cmd}»...")
+        crear_mosaico_etapas_audio(
+            senal=senal,
+            sr=sr,
+            ruta_guardado=ruta_salida,
+            nombre_archivo=nombre_base,
+            etiqueta=etiqueta_desc,
+            mostrar_ventana=mostrar_ventana,
+            silencioso=True,
+        )
+        rutas_generadas.append(ruta_salida)
+
+    print(f"\n[+] ¡Listo! Se generaron {len(rutas_generadas)} mosaicos comparativos en:")
+    print(f"    {os.path.abspath(carpeta_salida)}/")
+    return rutas_generadas
+
+
 # ==============================================================================
 # 5. MENÚ INTERACTIVO DE CONSOLA
 # ==============================================================================
@@ -1203,14 +1580,23 @@ def _probar_archivo_existente_menu(
     imprimir_resultado_prediccion(res)
 
     ver_graf = input(
-        "\n ¿Deseás ver el gráfico con la onda recortada y su posición en el mapa PCA? [s/N]: "
+        "\n Opciones de visualización: 'g' Gráfico PCA | 'm' Mosaico comparativo de etapas | [Enter] Continuar: "
     ).strip().lower()
-    if ver_graf in ("s", "si", "sí", "y"):
+    if ver_graf in ("g", "s", "si", "sí", "y"):
         graficar_prediccion_en_pca(
             paquete_modelo=paquete_modelo,
             senal=senal,
             sr=sr,
             resultado=res,
+            mostrar_ventana=True,
+        )
+    elif ver_graf == "m":
+        cmd_det = str(res.get("comando_mas_votado") or res.get("comando") or "")
+        crear_mosaico_etapas_audio(
+            senal=senal,
+            sr=sr,
+            nombre_archivo=os.path.basename(ruta_wav),
+            etiqueta=cmd_det,
             mostrar_ventana=True,
         )
 
@@ -1241,6 +1627,7 @@ def menu_interactivo(
         print("   [3] Probar el clasificador sobre un archivo .wav existente")
         print("   [4] Cambiar el valor de K (número de vecinos) y re-entrenar")
         print("   [5] Ver / cambiar micrófono activo del sistema (Ubuntu PipeWire)")
+        print("   [6] Generar mosaico comparativo de etapas de audio (como en huellas)")
         print("   [0] Salir")
         print("=" * 76)
 
@@ -1293,7 +1680,7 @@ def menu_interactivo(
 
                 try:
                     post = input(
-                        "\n Opciones: [Enter] Probar de nuevo | 'g' Ver gráfico PCA de esta toma | '0' Volver al menú: "
+                        "\n Opciones: [Enter] Probar de nuevo | 'g' Gráfico PCA | 'm' Mosaico de etapas | '0' Volver al menú: "
                     ).strip().lower()
                 except (KeyboardInterrupt, EOFError):
                     break
@@ -1311,7 +1698,23 @@ def menu_interactivo(
                     ).strip()
                     if cont == "0":
                         break
-                elif post in ("0", "q", "salir", "m"):
+                elif post == "m" and res.get("senal_audio") is not None:
+                    cmd_det = res.get("comando_mas_votado") or res.get("comando") or "Voz"
+                    ruta_mos = _generar_ruta_unica_mosaico_vivo(str(cmd_det))
+                    crear_mosaico_etapas_audio(
+                        senal=res["senal_audio"],
+                        sr=int(res["sample_rate"]),
+                        ruta_guardado=ruta_mos,
+                        nombre_archivo="Prueba de micrófono en vivo",
+                        etiqueta=str(cmd_det),
+                        mostrar_ventana=True,
+                    )
+                    cont = input(
+                        "\n Presioná [Enter] para hacer otra prueba de micrófono o '0' para volver al menú: "
+                    ).strip()
+                    if cont == "0":
+                        break
+                elif post in ("0", "q", "salir"):
                     break
 
         elif op == "3":
@@ -1339,8 +1742,59 @@ def menu_interactivo(
         elif op == "5":
             gv.menu_cambiar_microfono_sistema()
 
+        elif op == "6":
+            print("\n" + "-" * 72)
+            print(" GENERAR MOSAICO COMPARATIVO DE ETAPAS DE AUDIO")
+            print("-" * 72)
+            print("   [1] Generar 1 mosaico representativo por comando (Reconocer, Identificar, Salir)")
+            print("   [2] Generar mosaico de un archivo .wav específico (o número del metadata)")
+            print("   [3] Generar mosaicos para TODO el dataset")
+            print("   [0] Cancelar / Volver")
+            sub_op = input("\n Seleccioná una opción [Default: 1]: ").strip()
+            if not sub_op or sub_op == "1":
+                generar_mosaicos_dataset(
+                    directorio_base=directorio_base,
+                    max_por_clase=1,
+                    mostrar_ventana=True,
+                )
+            elif sub_op == "2":
+                metas = gv.leer_registros_metadata(directorio_base)
+                entrada_m = input(
+                    f" Ingresá número de fila (1 a {len(metas)}) o ruta a archivo .wav [Default: 1]: "
+                ).strip() or "1"
+                if entrada_m.isdigit() and 1 <= int(entrada_m) <= len(metas):
+                    elegido = metas[int(entrada_m) - 1]
+                    ruta_m = gv.resolver_ruta_en_disco(directorio_base, elegido["ruta_audio"])
+                    cmd_m = elegido.get("comando", "")
+                    pers_m = elegido.get("persona", "")
+                    lbl_m = f"{cmd_m} ({pers_m})" if pers_m else cmd_m
+                else:
+                    ruta_m = entrada_m
+                    lbl_m = ""
+                if os.path.isfile(ruta_m):
+                    s_m, sr_m = gv.leer_wav_mono(ruta_m, normalizar_float=True)
+                    crear_mosaico_etapas_audio(
+                        senal=s_m,
+                        sr=sr_m,
+                        nombre_archivo=os.path.basename(ruta_m),
+                        etiqueta=lbl_m,
+                        mostrar_ventana=True,
+                    )
+                else:
+                    print(f" [!] No se encontró el archivo: {ruta_m}")
+            elif sub_op == "3":
+                conf = input(
+                    " ¿Seguro que deseás generar mosaicos para todo el dataset? [s/N]: "
+                ).strip().lower()
+                if conf in ("s", "si", "sí", "y"):
+                    generar_mosaicos_dataset(
+                        directorio_base=directorio_base,
+                        max_por_clase=None,
+                        mostrar_ventana=False,
+                    )
+
         else:
-            print(" [!] Opción no reconocida. Elegí entre 0 y 5.")
+            print(" [!] Opción no reconocida. Elegí entre 0 y 6.")
 
 
 # ==============================================================================
@@ -1370,12 +1824,47 @@ def main() -> None:
         help="Ejecutar directamente el análisis estadístico y generar el gráfico PNG sin abrir menú",
     )
     parser.add_argument(
+        "--mosaico",
+        type=str,
+        default=None,
+        help="Ruta a un archivo .wav para generar directamente su mosaico comparativo de etapas",
+    )
+    parser.add_argument(
+        "--mosaicos-dataset",
+        type=int,
+        nargs="?",
+        const=1,
+        default=None,
+        help="Generar mosaicos comparativos para el dataset (por default 1 por clase, ej: --mosaicos-dataset 2)",
+    )
+    parser.add_argument(
         "--sin-ventana",
         action="store_true",
         help="Guardar los gráficos en disco sin abrir ventana interactiva de Matplotlib",
     )
 
     args = parser.parse_args()
+
+    if args.mosaico:
+        if not os.path.isfile(args.mosaico):
+            print(f"[!] Archivo no encontrado: {args.mosaico}")
+            sys.exit(1)
+        s, sr = gv.leer_wav_mono(args.mosaico, normalizar_float=True)
+        crear_mosaico_etapas_audio(
+            senal=s,
+            sr=sr,
+            nombre_archivo=os.path.basename(args.mosaico),
+            mostrar_ventana=not args.sin_ventana,
+        )
+        return
+
+    if args.mosaicos_dataset is not None:
+        generar_mosaicos_dataset(
+            directorio_base=args.dataset_dir,
+            max_por_clase=args.mosaicos_dataset if args.mosaicos_dataset > 0 else None,
+            mostrar_ventana=not args.sin_ventana,
+        )
+        return
 
     if args.analizar:
         analizar_y_graficar_dataset(

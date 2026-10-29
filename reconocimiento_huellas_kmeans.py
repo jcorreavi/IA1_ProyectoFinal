@@ -74,9 +74,9 @@ RUTA_GRAFICO_EXPERIMENTO = os.path.join(
 # para las 3 identidades sintéticas autorizadas. NO confundir con el parámetro K de
 # vecinos más cercanos del clasificador supervisado K-NN usado en el módulo de voz.
 K_CLUSTERS_DEFAULT = 3
-FACTOR_SIGMA_UMBRAL_DEFAULT = 4.35
+FACTOR_SIGMA_UMBRAL_DEFAULT = 3.25
 FACTOR_PISO_ESCALA = 0.075
-VERSION_EXTRACTOR_HUELLAS = 2
+VERSION_EXTRACTOR_HUELLAS = 3
 
 MAPA_CARPETA_A_IDENTIDAD: Dict[str, str] = {
     "Persona_1": "Identidad Sintética #1",
@@ -143,7 +143,7 @@ class EscaladorEstandarRegularizado(BaseEstimator, TransformerMixin):
         diffs = X_arr[:, None, :] - X_arr[nn_idx]
         local_rms = np.sqrt(np.mean(diffs**2, axis=(0, 1)) / 2.0)
 
-        pisos = np.full_like(local_rms, float(self.factor_piso))
+        pisos = np.maximum(1e-4, float(self.factor_piso) * sc0.scale_)
         # Piso suave mayor en los 3 indicadores enteros de presencia (carga_core, pres_L, pres_R)
         for idx_disc in (0, 3, 12):
             if idx_disc < len(pisos):
@@ -533,19 +533,19 @@ def extraer_caracteristicas_huella(
     retornar_info_geometrica: bool = False,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, object]]]:
     """
-    Representa una huella preprocesada mediante un vector discriminante de 55
-    características biométricas invariantes a traslación y rotación, compatible con
-    cualquier familia dactilar (Arcos, Presillas Internas/Externas y Verticilos):
+    Representa una huella preprocesada mediante un vector discriminante de 90
+    características biométricas invariantes a traslación y rotación, optimizado
+    para discriminar patrones homogéneos (incluso Arcos heterogéneos sin deltas):
       - [0..2]   (3) : Carga topológica de núcleo (0/1/2) y coordenadas `(core_u, core_v)`.
-      - [3..20]  (18): Canales laterales suaves Izquierdo (`u < 0`) y Derecho (`u > 0`)
-                       para Deltas (presencia, posición intrínseca, vector Core->Delta,
-                       distancia escalada, cos/sin angular y conteo de crestas Galton-Henry).
-      - [21..23] (3) : Perfiles longitudinales de densidad de crestas (`u = -0.45, 0, +0.45`).
-      - [24..47] (24): Campo de orientación intrínseco de crestas (`cos 2(θ-φ)`,
-                       `sin 2(θ-φ)`) ponderado por coherencia en grilla elíptica 4x3.
-      - [48..50] (3) : Descriptores de textura direccional de Gabor por franjas.
-      - [51..54] (4) : Centroide intrínseco de bifurcaciones (`CN=3` en esqueleto) y
-                       primeros 2 Momentos Invariantes de Hu del mapa de singularidad.
+      - [3..20]  (18): Descriptores de Delta (o criterios específicos de Arcos si len(deltas)==0:
+                       ápice, curvatura max/media, orientaciones laterales y transectos de ápice).
+      - [21..30] (10): Distribución de minucias, densidad global de crestas, ratio de bifurcaciones,
+                       balance de simetría lateral, curvatura superior, respuesta Gabor y Hu3.
+      - [31..33] (3) : Transectos longitudinales (verticales en u = -0.45, 0, +0.45).
+      - [34..36] (3) : Transectos perpendiculares (horizontales en v = -0.4, 0, +0.4).
+      - [37..84] (48): Campo de orientación intrínseco (cos 2θ, sin 2θ) en grilla fina 6x4 (24 celdas).
+      - [85..87] (3) : Descriptores de textura direccional de Gabor por franjas.
+      - [88..89] (2) : Momentos Invariantes de Hu del mapa interior de singularidades.
     """
     img_suav = etapas["sin_ruido"]
     img_gabor = etapas["gabor"]
@@ -558,7 +558,17 @@ def extraer_caracteristicas_huella(
     )
     escala_ref = float(np.sqrt(std_min * std_maj))
 
-    # 1. Singularidades de Poincaré multi-clase y conteo de crestas Galton-Henry
+    # Coordenadas intrínsecas globales (u, v) y campo de orientación relativo
+    h, w = img_suav.shape[:2]
+    yy, xx = np.indices((h, w), dtype=np.float32)
+    uu, vv = transformar_a_coordenadas_intrinsecas(
+        xx, yy, cx, cy, phi_rot, std_min, std_maj
+    )
+    theta_rel = theta_denso - phi_rot
+    cos2t = np.cos(2.0 * theta_rel)
+    sin2t = np.sin(2.0 * theta_rel)
+
+    # 1. Singularidades de Poincaré multi-clase
     sing = detectar_singularidades_poincare(
         img_gabor, hull, cx, cy, phi_rot, std_min, std_maj
     )
@@ -572,52 +582,138 @@ def extraer_caracteristicas_huella(
     else:
         core_u, core_v = 0.0, 0.0
 
-    pres_L = dLu = dLv = duL = dvL = distL = cosL = sinL = crL = 0.0
-    pres_R = dRu = dRv = duR = dvR = distR = cosR = sinR = crR = 0.0
+    deltas = sing["deltas"]
+    tiene_delta = len(deltas) > 0
     crestas_por_delta: List[int] = []
     deltas_xy_lista: List[Tuple[float, float]] = []
 
-    for d_item in sing["deltas"]:
-        dx, dy = d_item["xy"]
-        du, dv = d_item["uv"]
-        deltas_xy_lista.append((dx, dy))
+    # 2. Análisis global de minucias (Crossing Number) y topología de crestas
+    term_map, bif_map = detectar_minucias_crossing_number(img_skel, hull)
+    n_term = float(np.sum(term_map > 0))
+    n_bif = float(np.sum(bif_map > 0))
+    ratio_bif = n_bif / max(1.0, n_term)
 
-        # Partición suave de la unidad centrada en u = 0 (evita saltos discretos en Arcos en Tienda)
-        z = float(np.clip(du / 0.08, -30.0, 30.0))
-        w_R = 1.0 / (1.0 + np.exp(-z))
-        w_L = 1.0 - w_R
+    area_hull = float(np.sum(hull > 0))
+    skel_len = float(np.sum(img_skel < 128))
+    ridge_density = (skel_len / max(1.0, area_hull)) * 100.0
 
-        rel_u = du - core_u
-        rel_v = dv - core_v
-        ang = float(np.arctan2(rel_v, rel_u))
-        dist_n = float(np.hypot(dx - core_x, dy - core_y)) / (escala_ref + 1e-6)
-        cr_raw = (
-            contar_crestas_galton_henry(img_gabor, img_bin, (core_x, core_y), (dx, dy))
-            if tiene_core
-            else 0.0
+    by, bx = np.where(bif_map > 0)
+    if len(bx) > 0:
+        bu, bv = transformar_a_coordenadas_intrinsecas(
+            bx.astype(np.float32), by.astype(np.float32), cx, cy, phi_rot, std_min, std_maj
         )
-        crestas_por_delta.append(int(round(cr_raw)))
-        cr_n = cr_raw / 15.0
+        mean_bu, mean_bv = float(np.mean(bu)), float(np.mean(bv))
+    else:
+        mean_bu, mean_bv = 0.0, 0.0
 
-        pres_L += w_L
-        dLu += w_L * du
-        dLv += w_L * dv
-        duL += w_L * rel_u
-        dvL += w_L * rel_v
-        distL += w_L * dist_n
-        cosL += w_L * float(np.cos(ang))
-        sinL += w_L * float(np.sin(ang))
-        crL += w_L * cr_n
+    skel_left = float(np.sum((img_skel < 128) & (uu < 0)))
+    skel_right = float(np.sum((img_skel < 128) & (uu > 0)))
+    lr_balance = (skel_left / max(1.0, skel_right)) * 10.0
 
-        pres_R += w_R
-        dRu += w_R * du
-        dRv += w_R * dv
-        duR += w_R * rel_u
-        dvR += w_R * rel_v
-        distR += w_R * dist_n
-        cosR += w_R * float(np.cos(ang))
-        sinR += w_R * float(np.sin(ang))
-        crR += w_R * cr_n
+    # Magnitud de gradiente del campo direccional y curvatura superior
+    d_c2 = cv2.Sobel(cos2t, cv2.CV_32F, 1, 0, ksize=5)
+    d_s2 = cv2.Sobel(sin2t, cv2.CV_32F, 1, 0, ksize=5)
+    curv_mag = np.hypot(d_c2, d_s2) * peso_tex
+    mask_up = (np.abs(uu) < 0.8) & (vv < 0) & (vv > -0.7) & (peso_tex > 0.25)
+    curv_up = float(np.mean(curv_mag[mask_up])) if np.any(mask_up) else 0.0
+
+    hu_bin = cv2.HuMoments(cv2.moments((img_bin == 0).astype(np.uint8))).flatten()
+    f_hu2 = float(-np.sign(hu_bin[2]) * np.log10(np.abs(hu_bin[2]) + 1e-12))
+    gabor_hull = float(np.mean(img_gabor[hull > 0])) / 10.0
+
+    pres_L = dLu = dLv = duL = dvL = distL = cosL = sinL = crL = 0.0
+    pres_R = dRu = dRv = duR = dvR = distR = cosR = sinR = crR = 0.0
+
+    if tiene_delta:
+        for d_item in deltas:
+            dx, dy = d_item["xy"]
+            du, dv = d_item["uv"]
+            deltas_xy_lista.append((dx, dy))
+
+            z = float(np.clip(du / 0.08, -30.0, 30.0))
+            w_R = 1.0 / (1.0 + np.exp(-z))
+            w_L = 1.0 - w_R
+
+            rel_u = du - core_u
+            rel_v = dv - core_v
+            ang = float(np.arctan2(rel_v, rel_u))
+            dist_n = float(np.hypot(dx - core_x, dy - core_y)) / (escala_ref + 1e-6)
+            cr_raw = (
+                contar_crestas_galton_henry(img_gabor, img_bin, (core_x, core_y), (dx, dy))
+                if tiene_core
+                else 0.0
+            )
+            crestas_por_delta.append(int(round(cr_raw)))
+            cr_n = cr_raw / 15.0
+
+            pres_L += w_L
+            dLu += w_L * du
+            dLv += w_L * dv
+            duL += w_L * rel_u
+            dvL += w_L * rel_v
+            distL += w_L * dist_n
+            cosL += w_L * float(np.cos(ang))
+            sinL += w_L * float(np.sin(ang))
+            crL += w_L * cr_n
+
+            pres_R += w_R
+            dRu += w_R * du
+            dRv += w_R * dv
+            duR += w_R * rel_u
+            dvR += w_R * rel_v
+            distR += w_R * dist_n
+            cosR += w_R * float(np.cos(ang))
+            sinR += w_R * float(np.sin(ang))
+            crR += w_R * cr_n
+    else:
+        # CRITERIOS DEDICADOS PARA HUELLAS SIN DELTA (ARCOS):
+        # En huellas sin delta, se reemplazan los canales de deltas vacíos por
+        # la ubicación del ápice del arco, curvatura local, orientaciones laterales
+        # y 5 transectos horizontales a diferentes alturas.
+        mask_central = (np.abs(uu) < 0.8) & (np.abs(vv) < 0.8) & (peso_tex > 0.25)
+        curv_mag_c = np.where(mask_central, curv_mag, 0.0)
+        sw = float(np.sum(curv_mag_c)) + 1e-6
+        apex_u = float(np.sum(uu * curv_mag_c) / sw)
+        apex_v = float(np.sum(vv * curv_mag_c) / sw)
+        apex_curv_max = float(np.max(curv_mag_c))
+        apex_curv_mean = float(np.mean(curv_mag_c[mask_central])) if np.any(mask_central) else 0.0
+
+        mask_izq = mask_central & (uu < apex_u)
+        mask_der = mask_central & (uu > apex_u)
+        sw_i = float(np.sum(peso_tex[mask_izq])) + 1e-6
+        sw_d = float(np.sum(peso_tex[mask_der])) + 1e-6
+
+        c2_izq = float(np.sum(cos2t[mask_izq] * peso_tex[mask_izq]) / sw_i)
+        s2_izq = float(np.sum(sin2t[mask_izq] * peso_tex[mask_izq]) / sw_i)
+        c2_der = float(np.sum(cos2t[mask_der] * peso_tex[mask_der]) / sw_d)
+        s2_der = float(np.sum(sin2t[mask_der] * peso_tex[mask_der]) / sw_d)
+
+        # 5 transectos perpendiculares (horizontales) en el núcleo del arco
+        h_counts = []
+        for v_cut in (-0.5, -0.25, 0.0, 0.25, 0.5):
+            p_i = transformar_intrinseco_a_pixel(-0.85, v_cut, cx, cy, phi_rot, std_min, std_maj)
+            p_f = transformar_intrinseco_a_pixel(+0.85, v_cut, cx, cy, phi_rot, std_min, std_maj)
+            h_counts.append(contar_crestas_galton_henry(img_gabor, img_bin, p_i, p_f) / 10.0)
+
+        pres_L = 0.0
+        dLu = apex_u
+        dLv = apex_v
+        duL = apex_curv_max / 10.0
+        dvL = apex_curv_mean / 3.0
+        distL = c2_izq
+        cosL = s2_izq
+        sinL = h_counts[0]
+        crL = h_counts[1]
+
+        pres_R = 0.0
+        dRu = c2_der
+        dRv = s2_der
+        duR = mean_bu
+        dvR = mean_bv
+        distR = h_counts[2]
+        cosR = h_counts[3]
+        sinR = h_counts[4]
+        crR = ratio_bif
 
     caracteristicas: List[float] = [
         float(sing["carga_core"]),
@@ -641,9 +737,20 @@ def extraer_caracteristicas_huella(
         cosR,
         sinR,
         crR,
+        # Minucias y Estructura Global
+        n_term / 100.0,
+        n_bif / 30.0,
+        ratio_bif * 5.0,
+        ridge_density,
+        mean_bu,
+        mean_bv,
+        lr_balance,
+        curv_up,
+        gabor_hull,
+        f_hu2,
     ]
 
-    # Perfiles longitudinales de densidad de crestas (discriminan incluso Arcos sin singularidades)
+    # Transectos longitudinales (verticales): 3 columnas
     for u_col in (-0.45, 0.0, 0.45):
         p_ini = transformar_intrinseco_a_pixel(
             u_col, -0.85, cx, cy, phi_rot, std_min, std_maj
@@ -654,21 +761,22 @@ def extraer_caracteristicas_huella(
         dens = contar_crestas_galton_henry(img_gabor, img_bin, p_ini, p_fin) / 22.0
         caracteristicas.append(float(dens))
 
-    # 2. Orientación local de crestas en grilla canónica 4x3 alineada al dedo
-    h, w = img_suav.shape[:2]
-    yy, xx = np.indices((h, w), dtype=np.float32)
-    uu, vv = transformar_a_coordenadas_intrinsecas(
-        xx, yy, cx, cy, phi_rot, std_min, std_maj
-    )
+    # Transectos perpendiculares (horizontales): 3 filas
+    for v_row in (-0.4, 0.0, 0.4):
+        p_ini = transformar_intrinseco_a_pixel(
+            -0.85, v_row, cx, cy, phi_rot, std_min, std_maj
+        )
+        p_fin = transformar_intrinseco_a_pixel(
+            +0.85, v_row, cx, cy, phi_rot, std_min, std_maj
+        )
+        dens = contar_crestas_galton_henry(img_gabor, img_bin, p_ini, p_fin) / 20.0
+        caracteristicas.append(float(dens))
 
-    theta_rel = theta_denso - phi_rot
-    cos2t = np.cos(2.0 * theta_rel)
-    sin2t = np.sin(2.0 * theta_rel)
-
-    u_edges = np.linspace(-1.15, 1.15, 4)
-    v_edges = np.linspace(-1.25, 1.25, 5)
-    for i in range(4):
-        for j in range(3):
+    # Campo de orientación local en grilla fina 6x4 (24 celdas -> 48 descriptores)
+    u_edges = np.linspace(-1.15, 1.15, 5)
+    v_edges = np.linspace(-1.25, 1.25, 7)
+    for i in range(6):
+        for j in range(4):
             celda = (
                 (vv >= v_edges[i])
                 & (vv < v_edges[i + 1])
@@ -680,7 +788,7 @@ def extraer_caracteristicas_huella(
             caracteristicas.append(float(np.sum(cos2t[celda] * w_c) / sw))
             caracteristicas.append(float(np.sum(sin2t[celda] * w_c) / sw))
 
-    # 3. Descriptores de textura direccional sobre la respuesta de Gabor
+    # Descriptores de textura direccional sobre la respuesta de Gabor
     grad_gabor = (
         np.hypot(
             cv2.Sobel(img_gabor.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3),
@@ -698,23 +806,7 @@ def extraer_caracteristicas_huella(
         sw = float(np.sum(w_f)) + 1e-6
         caracteristicas.append(float(np.sum(grad_gabor[franja] * w_f) / sw))
 
-    # 4. Distribución espacial de minucias en el esqueleto + Momentos de Hu
-    term_map, bif_map = detectar_minucias_crossing_number(img_skel, hull)
-    by, bx = np.where(bif_map > 0)
-    if len(bx) > 3:
-        bu, bv = transformar_a_coordenadas_intrinsecas(
-            bx.astype(np.float32),
-            by.astype(np.float32),
-            cx,
-            cy,
-            phi_rot,
-            std_min,
-            std_maj,
-        )
-        caracteristicas.extend([float(np.mean(bu)), float(np.mean(bv))])
-    else:
-        caracteristicas.extend([0.0, 0.0])
-
+    # Momentos de Hu de la envolvente interior de singularidades
     int_soft = cv2.GaussianBlur(
         (
             cv2.erode(
@@ -755,8 +847,12 @@ def extraer_caracteristicas_huella(
         "crestas_por_delta": crestas_por_delta,
         "conteo_crestas": conteo_total,
         "tipo_topologico": sing["tipo_topologico"],
-        "num_terminaciones": int(np.sum(term_map > 0)),
-        "num_bifurcaciones": int(np.sum(bif_map > 0)),
+        "num_terminaciones": int(n_term),
+        "num_bifurcaciones": int(n_bif),
+        "ratio_bif": float(ratio_bif),
+        "ridge_density": float(ridge_density / 100.0),
+        "lr_balance": float(lr_balance / 10.0),
+        "curv_up": float(curv_up),
     }
     return vector, info_geo
 
@@ -923,8 +1019,8 @@ def entrenar_modelo_huellas(
     radio_medio = float(np.mean(radios_c))
     escala_cluster = np.maximum(radios_c / max(radio_medio, 1e-4), 0.65).astype(np.float32)
 
-    dist_matriz_train = dist_matriz_raw / escala_cluster[None, :]
-    dist_min_train = np.min(dist_matriz_train, axis=1)
+    dist_matriz_train = dist_matriz_raw
+    dist_min_train = dist_propia_raw
 
     media_dist_train = float(np.mean(dist_min_train))
     std_dist_train = float(np.std(dist_min_train))
@@ -935,14 +1031,42 @@ def entrenar_modelo_huellas(
     max_dist_train = float(np.max(dist_min_train))
     p95_dist_train = float(np.percentile(dist_min_train, 95))
 
-    # Calibración estadística robusta (MAD + P95) sobre el conjunto autorizado:
-    # evita que una sola impresión distorsionada infle artificialmente el umbral τ
-    umbral_distancia = float(
-        max(
-            mediana_dist_train + factor_sigma_umbral * sigma_mad_train,
-            p95_dist_train * 1.15,
-        )
-    )
+    # Calibración estadística robusta de umbrales específicos por clúster (τ_c) y envolventes biométricas
+    umbrales_por_cluster = np.zeros(k_clusters, dtype=np.float32)
+    perfiles_autorizados: Dict[int, Dict[str, object]] = {}
+
+    for ci in range(k_clusters):
+        id_name = mapa_cluster_a_identidad[ci]
+        mask_ci = clusters_train == ci
+        vals_ci = dist_propia_raw[mask_ci]
+        if len(vals_ci) >= 3:
+            med_ci = float(np.median(vals_ci))
+            mad_ci = float(1.4826 * np.median(np.abs(vals_ci - med_ci)))
+            p95_ci = float(np.percentile(vals_ci, 95))
+            max_ci = float(np.max(vals_ci))
+            umbrales_por_cluster[ci] = max(
+                med_ci + factor_sigma_umbral * mad_ci, p95_ci * 1.15, max_ci * 1.05
+            )
+        else:
+            umbrales_por_cluster[ci] = float(max_dist_train * 1.10)
+
+        # Envolvente biométrica de entrenamiento (densidad, ratio de bifurcaciones, simetría)
+        r_bif = X_train[mask_ci, 23] / 5.0
+        r_dens = X_train[mask_ci, 24] / 100.0
+        r_bal = X_train[mask_ci, 27] / 10.0
+
+        perfiles_autorizados[ci] = {
+            "id_name": id_name,
+            "tau": float(umbrales_por_cluster[ci]),
+            "min_density": float(np.min(r_dens) * 0.95),
+            "max_density": float(np.max(r_dens) * 1.05),
+            "min_ratio_bif": float(np.min(r_bif) * 0.80),
+            "max_ratio_bif": float(np.max(r_bif) * 1.20),
+            "min_balance": float(np.min(r_bal) * 0.90),
+            "max_balance": float(np.max(r_bal) * 1.10),
+        }
+
+    umbral_distancia = float(np.max(umbrales_por_cluster))
 
     # Ajuste de Análisis por Componentes Principales (PCA) sobre X_train_std
     n_comp_max = min(15, X_train_std.shape[0], X_train_std.shape[1])
@@ -970,6 +1094,8 @@ def entrenar_modelo_huellas(
         "mapa_cluster_a_identidad": mapa_cluster_a_identidad,
         "mapa_cluster_a_carpeta": mapa_cluster_a_carpeta,
         "umbral_distancia": umbral_distancia,
+        "umbrales_por_cluster": umbrales_por_cluster,
+        "perfiles_autorizados": perfiles_autorizados,
         "factor_sigma_umbral": factor_sigma_umbral,
         "estadisticas_dist_train": {
             "media": media_dist_train,
@@ -1066,39 +1192,98 @@ def clasificar_vector_huella(
     umbral_personalizado: Optional[float] = None,
 ) -> Dict[str, object]:
     """
-    Evalúa un vector de 55 características frente a los centroides K-Means y aplica
-    el criterio de aceptación/rechazo por umbral de distancia euclídea equiparada.
+    Evalúa un vector de 90 características biométricas frente a los centroides K-Means
+    y aplica el criterio de control dual:
+      1. Proximidad euclídea al centroide dentro del umbral propio del clúster (τ_c).
+      2. Consistencia anatómica del perfil biométrico (densidad de crestas, ratio de
+         bifurcaciones y simetría lateral) frente a la envolvente autorizada del clúster.
     """
     escalador: EscaladorEstandarRegularizado = paquete_modelo["escalador"]
     kmeans: KMeans = paquete_modelo["kmeans"]
     pca_modelo: PCA = paquete_modelo["pca_modelo"]
     mapa_id: Dict[int, str] = paquete_modelo["mapa_cluster_a_identidad"]
     mapa_carp: Dict[int, str] = paquete_modelo["mapa_cluster_a_carpeta"]
-    umbral = (
-        float(umbral_personalizado)
-        if umbral_personalizado is not None
-        else float(paquete_modelo["umbral_distancia"])
-    )
+
+    umbrales_por_cluster = paquete_modelo.get("umbrales_por_cluster")
+    if umbrales_por_cluster is None:
+        u_def = float(paquete_modelo["umbral_distancia"])
+        umbrales_por_cluster = np.full(kmeans.n_clusters, u_def, dtype=np.float32)
+    else:
+        umbrales_por_cluster = np.asarray(umbrales_por_cluster, dtype=np.float32)
+
+    if umbral_personalizado is not None:
+        factor_escalado = float(umbral_personalizado) / max(
+            1e-4, float(paquete_modelo.get("umbral_distancia", 1.0))
+        )
+        umbrales_por_cluster = umbrales_por_cluster * factor_escalado
 
     x_2d = np.asarray(vector_x, dtype=np.float32).reshape(1, -1)
     x_std = escalador.transform(x_2d)
-    escala_cluster = np.asarray(
-        paquete_modelo.get("escala_cluster", np.ones(kmeans.n_clusters, dtype=np.float32)),
-        dtype=np.float32,
-    )
-    distancias = (kmeans.transform(x_std)[0]) / escala_cluster
+    distancias_raw = kmeans.transform(x_std)[0]
 
-    cluster_ganador = int(np.argmin(distancias))
-    distancia_min = float(distancias[cluster_ganador])
+    # Ratio de distancia respecto del umbral propio del clúster:
+    ratios = distancias_raw / np.maximum(umbrales_por_cluster, 1e-4)
+    cluster_ganador = int(np.argmin(ratios))
+    distancia_min = float(distancias_raw[cluster_ganador])
+    umbral_ganador = float(umbrales_por_cluster[cluster_ganador])
     identidad_cercana = mapa_id[cluster_ganador]
     carpeta_cercana = mapa_carp[cluster_ganador]
 
-    autorizado = bool(distancia_min <= umbral)
+    # Criterio de Control Nivel 1: Distancia euclídea al centroide dentro de tau_c
+    ok_distancia = bool(distancia_min <= umbral_ganador)
+
+    # Criterio de Control Nivel 2: Consistencia anatómica del perfil biométrico
+    perfiles = paquete_modelo.get("perfiles_autorizados", {})
+    p = perfiles.get(cluster_ganador)
+    ok_perfil = True
+    motivo_rechazo: List[str] = []
+
+    if p is not None and len(vector_x) >= 28:
+        r_bif = float(vector_x[23] / 5.0)
+        r_dens = float(vector_x[24] / 100.0)
+        r_bal = float(vector_x[27] / 10.0)
+
+        # En Arcos (Identidad Sintética #1), verificación de invariantes topológicas
+        if p.get("id_name") == "Identidad Sintética #1":
+            if r_dens < p["min_density"]:
+                ok_perfil = False
+                motivo_rechazo.append(
+                    f"Densidad de crestas ({r_dens:.4f}) inferior al patrón autorizado ({p['min_density']:.4f})"
+                )
+            elif r_dens > p["max_density"]:
+                ok_perfil = False
+                motivo_rechazo.append(
+                    f"Densidad de crestas ({r_dens:.4f}) superior al patrón autorizado ({p['max_density']:.4f})"
+                )
+
+            if r_bif < p["min_ratio_bif"]:
+                ok_perfil = False
+                motivo_rechazo.append(
+                    f"Ratio de bifurcaciones ({r_bif:.3f}) menor al rango autorizado ({p['min_ratio_bif']:.3f})"
+                )
+            elif r_bif > p["max_ratio_bif"]:
+                ok_perfil = False
+                motivo_rechazo.append(
+                    f"Ratio de bifurcaciones ({r_bif:.3f}) mayor al rango autorizado ({p['max_ratio_bif']:.3f})"
+                )
+
+            if r_bal < p["min_balance"] or r_bal > p["max_balance"]:
+                ok_perfil = False
+                motivo_rechazo.append(
+                    f"Asimetría lateral ({r_bal:.3f}) fuera del rango de tolerancia [{p['min_balance']:.3f}, {p['max_balance']:.3f}]"
+                )
+
+    if not ok_distancia and not motivo_rechazo:
+        motivo_rechazo.append(
+            f"Distancia euclídea ({distancia_min:.2f}) supera umbral de clúster (τ = {umbral_ganador:.2f})"
+        )
+
+    autorizado = bool(ok_distancia and ok_perfil)
     estado_acceso = "AUTORIZADO" if autorizado else "NO AUTORIZADO"
     identidad_final = identidad_cercana if autorizado else ETIQUETA_NO_AUTORIZADO
 
     distancias_por_identidad_raw: Dict[str, float] = {}
-    for c_idx, d_val in enumerate(distancias):
+    for c_idx, d_val in enumerate(distancias_raw):
         etiqueta_c = mapa_id[int(c_idx)]
         if (
             etiqueta_c not in distancias_por_identidad_raw
@@ -1125,11 +1310,14 @@ def clasificar_vector_huella(
         "persona_carpeta": carpeta_cercana if autorizado else "Intruso",
         "cluster_idx": cluster_ganador,
         "distancia_min": distancia_min,
-        "umbral": umbral,
-        "margen_umbral": float(umbral - distancia_min),
-        "distancias_clusters": [float(d) for d in distancias],
+        "umbral": umbral_ganador,
+        "margen_umbral": float(umbral_ganador - distancia_min),
+        "distancias_clusters": [float(d) for d in distancias_raw],
         "distancias_por_identidad": distancias_por_identidad,
         "vector_pca": coord_pca,
+        "ok_distancia": ok_distancia,
+        "ok_perfil": ok_perfil,
+        "motivo_rechazo": motivo_rechazo,
     }
 
 
@@ -1536,12 +1724,14 @@ def analizar_y_graficar_dataset_huellas(
     k_clusters: int = K_CLUSTERS_DEFAULT,
     umbral_override: Optional[float] = None,
     mostrar_ventana: bool = True,
+    mostrar_intrusos_3d: bool = False,
 ) -> Dict[str, object]:
     """
     Ejecuta la evaluación integral del sistema de huellas (entrenamiento K-Means k=3,
     validación de umbral, prueba sobre autorizados e intrusos, métricas FAR/FRR,
     pureza de clústeres, coeficiente de silueta y PCA 2D/3D) y guarda el panel de
     4 gráficos en `resultados_huellas/analisis_kmeans_pca_huellas.png`.
+    Permite alternar de forma interactiva la visualización de intrusos en el panel 3D.
     """
     paquete = entrenar_modelo_huellas(
         directorio_entrenamiento=directorio_entrenamiento,
@@ -1582,18 +1772,17 @@ def analizar_y_graficar_dataset_huellas(
     X_test_std = escalador.transform(X_test)
     X_test_pca = pca_modelo.transform(X_test_std)
 
-    escala_cluster = np.asarray(
-        paquete.get("escala_cluster", np.ones(kmeans.n_clusters, dtype=np.float32)),
-        dtype=np.float32,
-    )
-    dists_test_mat = kmeans.transform(X_test_std) / escala_cluster[None, :]
-    dist_min_test = np.min(dists_test_mat, axis=1)
-    clusters_test = np.argmin(dists_test_mat, axis=1)
-
+    # Evaluación mediante el clasificador de doble nivel (K-Means + Envolvente Biométrica)
+    res_test = [
+        clasificar_vector_huella(v, paquete, umbral_personalizado=umbral_override)
+        for v in X_test
+    ]
+    dist_min_test = np.asarray([r["distancia_min"] for r in res_test], dtype=np.float32)
+    clusters_test = np.asarray([r["cluster_idx"] for r in res_test], dtype=int)
     y_test_pred = np.asarray(
         [
-            mapa_id[int(c)] if d <= umbral else ETIQUETA_INTRUSO_REPORTE
-            for c, d in zip(clusters_test, dist_min_test)
+            r["identidad"] if r["autorizado"] else ETIQUETA_INTRUSO_REPORTE
+            for r in res_test
         ]
     )
 
@@ -1602,12 +1791,12 @@ def analizar_y_graficar_dataset_huellas(
 
     exactitud_global_test = float(accuracy_score(y_test_real, y_test_pred))
     frr = (
-        float(np.mean(dist_min_test[mask_aut_test] > umbral))
+        float(np.mean([not r["autorizado"] for r, m in zip(res_test, mask_aut_test) if m]))
         if np.any(mask_aut_test)
         else 0.0
     )
     far = (
-        float(np.mean(dist_min_test[mask_int_test] <= umbral))
+        float(np.mean([r["autorizado"] for r, m in zip(res_test, mask_int_test) if m]))
         if np.any(mask_int_test)
         else 0.0
     )
@@ -1741,7 +1930,7 @@ def analizar_y_graficar_dataset_huellas(
     ax1.legend(loc="upper right", fontsize=7.8, ncol=2, framealpha=0.92)
     ax1.grid(True, linestyle=":", alpha=0.5)
 
-    # --- PANEL 2: Proyección Tridimensional PCA 3D (Autorizados + Centroides) ---
+    # --- PANEL 2: Proyección Tridimensional PCA 3D (Autorizados + Centroides [+ Intrusos interactivos]) ---
     ax2 = fig.add_subplot(2, 2, 2, projection="3d")
     for id_label in IDENTIDADES_ORDEN:
         m_tr = y_train == id_label
@@ -1772,16 +1961,37 @@ def analizar_y_graficar_dataset_huellas(
             s=250,
             edgecolors="black",
             linewidth=1.4,
+            label="Centroides K-Means" if c_idx == 0 else None,
         )
+
+    # Intrusos en 3D (visibilidad interactiva)
+    scatter_intrusos_3d = None
+    if np.any(mask_int_test):
+        p3_int = X_test_pca[mask_int_test, :3]
+        scatter_intrusos_3d = ax2.scatter(
+            p3_int[:, 0],
+            p3_int[:, 1],
+            p3_int[:, 2],
+            c=COLORES_IDENTIDADES[ETIQUETA_INTRUSO_REPORTE],
+            marker="X",
+            s=75,
+            edgecolors="black",
+            linewidth=0.8,
+            alpha=0.88,
+            zorder=8,
+            label=f"Intrusos (n={len(p3_int)})",
+        )
+        scatter_intrusos_3d.set_visible(bool(mostrar_intrusos_3d))
+
     ax2.set_title(
-        f"2. Clústeres Autorizados en PCA 3D ({var_3d:.1f}% var. acumulada)",
+        f"2. Clústeres en PCA 3D ({var_3d:.1f}% var. acumulada)",
         fontsize=11,
         fontweight="bold",
     )
     ax2.set_xlabel(f"PC1 ({var_ratio[0]:.1f}%)")
     ax2.set_ylabel(f"PC2 ({var_ratio[1]:.1f}%)")
     ax2.set_zlabel(f"PC3 ({var_ratio[2]:.1f}%)")
-    ax2.legend(loc="upper right", fontsize=8.2)
+    ax2.legend(loc="upper right", fontsize=8.0)
 
     # --- PANEL 3: Matriz de Confusión en Prueba (4x4 con Intrusos) ---
     ax3 = fig.add_subplot(2, 2, 3)
@@ -1834,7 +2044,24 @@ def analizar_y_graficar_dataset_huellas(
     # --- PANEL 4: Justificación Experimental del Umbral de Distancia ---
     ax4 = fig.add_subplot(2, 2, 4)
     dists_aut_test = dist_min_test[mask_aut_test]
-    dists_int_test = dist_min_test[mask_int_test]
+
+    # Desglose cromático de intrusos para correspondencia total con la Matriz de Confusión
+    dists_int_fp = [
+        r["distancia_min"]
+        for r, m in zip(res_test, mask_int_test)
+        if m and r["autorizado"]
+    ]
+    dists_int_vetados = [
+        r["distancia_min"]
+        for r, m in zip(res_test, mask_int_test)
+        if m and not r["autorizado"] and r["ok_distancia"]
+    ]
+    dists_int_dist = [
+        r["distancia_min"]
+        for r, m in zip(res_test, mask_int_test)
+        if m and not r["ok_distancia"]
+    ]
+
     max_x = max(
         float(np.max(dist_min_test)) if len(dist_min_test) else 15.0,
         umbral * 1.4,
@@ -1844,7 +2071,7 @@ def analizar_y_graficar_dataset_huellas(
     ax4.hist(
         dist_min_train,
         bins=bins,
-        alpha=0.55,
+        alpha=0.45,
         color="#1f77b4",
         edgecolor="black",
         label=f"Entrenamiento Autorizado (n={len(dist_min_train)}, máx={np.max(dist_min_train):.2f})",
@@ -1853,19 +2080,45 @@ def analizar_y_graficar_dataset_huellas(
         ax4.hist(
             dists_aut_test,
             bins=bins,
-            alpha=0.68,
+            alpha=0.60,
             color="#2ca02c",
             edgecolor="black",
             label=f"Prueba Autorizada (n={len(dists_aut_test)}, máx={np.max(dists_aut_test):.2f})",
         )
-    if len(dists_int_test) > 0:
+
+    # Intrusos apilados con diferenciación cromática de decisión (distancia vs perfil)
+    lista_intrusos = []
+    colores_intrusos = []
+    labels_intrusos = []
+
+    if len(dists_int_dist) > 0:
+        lista_intrusos.append(dists_int_dist)
+        colores_intrusos.append("#d62728")
+        labels_intrusos.append(
+            f"Intrusos Rechazados por Distancia (n={len(dists_int_dist)}, d > τ)"
+        )
+    if len(dists_int_vetados) > 0:
+        lista_intrusos.append(dists_int_vetados)
+        colores_intrusos.append("#ff7f0e")
+        labels_intrusos.append(
+            f"Intrusos Vetados por Perfil (n={len(dists_int_vetados)}, d ≤ τ)"
+        )
+    if len(dists_int_fp) > 0:
+        lista_intrusos.append(dists_int_fp)
+        colores_intrusos.append("#9467bd")
+        labels_intrusos.append(
+            f"Falsos Positivos Aceptados (n={len(dists_int_fp)}, d ≤ τ)"
+        )
+
+    if lista_intrusos:
         ax4.hist(
-            dists_int_test,
+            lista_intrusos,
             bins=bins,
-            alpha=0.78,
-            color="#d62728",
+            stacked=True,
+            alpha=0.85,
+            color=colores_intrusos,
             edgecolor="black",
-            label=f"Intrusos No Autorizados (n={len(dists_int_test)}, mín={np.min(dists_int_test):.2f})",
+            label=labels_intrusos,
         )
 
     ax4.axvline(
@@ -1879,17 +2132,39 @@ def analizar_y_graficar_dataset_huellas(
     ax4.axvspan(umbral, max_x * 1.08, color="#d62728", alpha=0.05)
 
     ax4.set_title(
-        "4. Distribución de Distancias al Centroide y Umbral de Rechazo",
+        "4. Distribución de Distancias y Criterio de Control Dual",
         fontsize=11,
         fontweight="bold",
     )
     ax4.set_xlabel("Distancia Euclídea al Centroide K-Means más cercano")
     ax4.set_ylabel("Cantidad de huellas")
     ax4.set_xlim(0, max_x * 1.06)
-    ax4.legend(loc="upper right", fontsize=8.3)
+    ax4.legend(loc="upper right", fontsize=7.8)
     ax4.grid(True, linestyle=":", alpha=0.5)
 
     plt.tight_layout(rect=[0, 0.01, 1, 0.94])
+
+    # Control interactivo de visualización de intrusos en 3D
+    if scatter_intrusos_3d is not None:
+        from matplotlib.widgets import CheckButtons
+
+        ax_chk = fig.add_axes([0.84, 0.948, 0.14, 0.036])
+        chk_intrusos = CheckButtons(
+            ax_chk,
+            ["Intrusos en 3D"],
+            [bool(mostrar_intrusos_3d)],
+        )
+        chk_intrusos.labels[0].set_fontsize(8.2)
+        chk_intrusos.labels[0].set_fontweight("bold")
+
+        def _alternar_intrusos(label):
+            vis = not scatter_intrusos_3d.get_visible()
+            scatter_intrusos_3d.set_visible(vis)
+            ax2.legend(loc="upper right", fontsize=7.8)
+            fig.canvas.draw_idle()
+
+        chk_intrusos.on_clicked(_alternar_intrusos)
+        fig._chk_intrusos = chk_intrusos
     fig.savefig(RUTA_GRAFICO_ANALISIS, dpi=200)
     print(f"\n[+] Gráfico integral guardado en: {os.path.abspath(RUTA_GRAFICO_ANALISIS)}")
     print("=" * 78)
@@ -2084,10 +2359,25 @@ def main() -> None:
         action="store_true",
         help="Guardar gráficos sin abrir ventana interactiva de Matplotlib",
     )
+    parser.add_argument(
+        "--con-intrusos-3d",
+        action="store_true",
+        default=False,
+        help="Muestra inicialmente las nubes de intrusos en la proyección PCA 3D (en ventana interactiva se puede alternar con el checkbox)",
+    )
+    parser.add_argument(
+        "--sin-intrusos-3d",
+        action="store_false",
+        dest="con_intrusos_3d",
+        help="Oculta los intrusos en la proyección PCA 3D",
+    )
     args = parser.parse_args()
 
     if args.analizar:
-        analizar_y_graficar_dataset_huellas(mostrar_ventana=not args.sin_ventana)
+        analizar_y_graficar_dataset_huellas(
+            mostrar_ventana=not args.sin_ventana,
+            mostrar_intrusos_3d=args.con_intrusos_3d,
+        )
         return
 
     menu_interactivo()
