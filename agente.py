@@ -52,6 +52,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import grabador_voz as gv
+import generador_anguli as ga
 import preprocesamiento as prep
 import reconocimiento_huellas_kmeans as rhk
 import reconocimiento_voz_knn as rv
@@ -146,6 +147,15 @@ def sincronizar_bandeja_agente(
                 and existente.lower().endswith(prep.EXTENSIONES_VALIDAS)
                 and existente not in esperados
             ):
+                ex_low = existente.lower()
+                # Preservar huellas sintéticas generadas en vivo por Anguli o personalizadas
+                if (
+                    ex_low.startswith("huella_")
+                    or ex_low.startswith("anguli_")
+                    or ex_low.startswith("sintetica_")
+                    or "anguli" in ex_low
+                ):
+                    continue
                 try:
                     os.remove(ruta_ex)
                 except OSError:
@@ -272,6 +282,10 @@ class AgenteControlAccesoGUI:
         self.imagen_original_actual: Optional[np.ndarray] = None
         self.resultado_huella_actual: Optional[Dict[str, object]] = None
         self.estado_huella: str = self.ESTADO_SIN_SELECCION
+
+        # Configuración de Anguli (MinGW/Wine) para generación en vivo
+        self.ruta_anguli: str = ga.detectar_directorio_anguli()
+        self.generando_huella_anguli: bool = False
 
         # Subcarpeta activa del análisis en curso (para agrupar Reconocer + Identificar de la misma huella)
         self.carpeta_analisis_actual: Optional[str] = None
@@ -483,11 +497,129 @@ class AgenteControlAccesoGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.listbox_huellas.bind("<<ListboxSelect>>", self._al_seleccionar_huella_lista)
 
+        # --- SECCIÓN ANGULI: GENERACIÓN DE HUELLAS SINTÉTICAS EN VIVO ---
+        frame_anguli = tk.LabelFrame(
+            col_izq,
+            text=" Generador Anguli (En vivo) ",
+            bg="#ffffff",
+            fg="#0f172a",
+            font=("DejaVu Sans", 9, "bold"),
+            padx=8,
+            pady=6,
+            relief="solid",
+            borderwidth=1,
+        )
+        frame_anguli.pack(fill=tk.X, pady=(8, 0))
+
+        tk.Label(
+            frame_anguli,
+            text="Crear y probar huellas sintéticas al instante:",
+            bg="#ffffff",
+            fg="#475569",
+            font=("DejaVu Sans", 8),
+            anchor="w",
+        ).pack(fill=tk.X, pady=(0, 4))
+
+        fila_anguli_btn1 = tk.Frame(frame_anguli, bg="#ffffff")
+        fila_anguli_btn1.pack(fill=tk.X, pady=2)
+
+        self.btn_anguli_p1 = tk.Button(
+            fila_anguli_btn1,
+            text="👤 P1 (Arch)",
+            command=lambda: self._accion_generar_anguli_autorizada(1),
+            bg="#15803d",
+            fg="#ffffff",
+            activebackground="#166534",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 8, "bold"),
+            relief="flat",
+            padx=2,
+            pady=4,
+            cursor="hand2",
+        )
+        self.btn_anguli_p1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+
+        self.btn_anguli_p2 = tk.Button(
+            fila_anguli_btn1,
+            text="👤 P2 (Nat)",
+            command=lambda: self._accion_generar_anguli_autorizada(2),
+            bg="#15803d",
+            fg="#ffffff",
+            activebackground="#166534",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 8, "bold"),
+            relief="flat",
+            padx=2,
+            pady=4,
+            cursor="hand2",
+        )
+        self.btn_anguli_p2.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 2))
+
+        self.btn_anguli_p3 = tk.Button(
+            fila_anguli_btn1,
+            text="👤 P3 (Nat)",
+            command=lambda: self._accion_generar_anguli_autorizada(3),
+            bg="#15803d",
+            fg="#ffffff",
+            activebackground="#166534",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 8, "bold"),
+            relief="flat",
+            padx=2,
+            pady=4,
+            cursor="hand2",
+        )
+        self.btn_anguli_p3.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 0))
+
+        fila_anguli_btn2 = tk.Frame(frame_anguli, bg="#ffffff")
+        fila_anguli_btn2.pack(fill=tk.X, pady=(3, 2))
+
+        self.btn_anguli_intrusa = tk.Button(
+            fila_anguli_btn2,
+            text="🚨 Intrusa (Azar)",
+            command=self._accion_generar_anguli_intrusa,
+            bg="#b91c1c",
+            fg="#ffffff",
+            activebackground="#991b1b",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 8, "bold"),
+            relief="flat",
+            padx=4,
+            pady=3,
+            cursor="hand2",
+        )
+        self.btn_anguli_intrusa.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
+
+        self.btn_anguli_dialogo = tk.Button(
+            fila_anguli_btn2,
+            text="⚙ Más opciones...",
+            command=self._abrir_dialogo_anguli_personalizado,
+            bg="#e2e8f0",
+            fg="#0f172a",
+            activebackground="#cbd5e1",
+            font=("DejaVu Sans", 8),
+            relief="flat",
+            pady=3,
+            cursor="hand2",
+        )
+        self.btn_anguli_dialogo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(3, 0))
+
+        self.lbl_estado_anguli = tk.Label(
+            frame_anguli,
+            text="Anguli listo (Wine)",
+            bg="#f8fafc",
+            fg="#64748b",
+            font=("DejaVu Sans", 8),
+            pady=2,
+            relief="groove",
+        )
+        self.lbl_estado_anguli.pack(fill=tk.X, pady=(4, 0))
+
         nota_secuencia = tk.Label(
             col_izq,
             text=(
                 "Flujo del Agente:\n"
-                " • Elegí una huella para previsualizarla.\n"
+                " • Generá o elegí una muestra.\n"
                 " • Decí «Reconocer» → AUTORIZADO / NO AUT.\n"
                 " • Decí «Identificar» → Identidad Sintética #X.\n"
                 " • Decí «Salir» → Finaliza el agente."
@@ -498,11 +630,11 @@ class AgenteControlAccesoGUI:
             anchor="w",
             font=("DejaVu Sans", 8),
             padx=8,
-            pady=8,
+            pady=6,
             relief="solid",
             borderwidth=1,
         )
-        nota_secuencia.pack(fill=tk.X, pady=(10, 0))
+        nota_secuencia.pack(fill=tk.X, pady=(8, 0))
 
         # --- COLUMNA CENTRAL: Previsualización y Gráficos en Pestañas ---
         col_cen = ttk.Frame(main_pane, style="Card.TFrame", padding=10)
@@ -878,17 +1010,36 @@ class AgenteControlAccesoGUI:
         self.txt_bitacora.see(tk.END)
         self.txt_bitacora.config(state=tk.DISABLED)
 
-    def _recargar_lista_huellas(self, seleccionar_primera: bool = False) -> None:
+    def _recargar_lista_huellas(
+        self,
+        seleccionar_primera: bool = False,
+        seleccionar_archivo: Optional[str] = None,
+    ) -> None:
         carpeta = self.var_carpeta_bandeja.get()
         self.archivos_bandeja = listar_imagenes_en_carpeta(carpeta)
         self.listbox_huellas.delete(0, tk.END)
+
+        idx_encontrado: Optional[int] = None
         for idx, ruta in enumerate(self.archivos_bandeja, 1):
-            self.listbox_huellas.insert(tk.END, f" {idx:02d}. {os.path.basename(ruta)}")
+            nombre = os.path.basename(ruta)
+            self.listbox_huellas.insert(tk.END, f" {idx:02d}. {nombre}")
+            if seleccionar_archivo:
+                if (
+                    os.path.abspath(ruta) == os.path.abspath(seleccionar_archivo)
+                    or nombre == os.path.basename(seleccionar_archivo)
+                ):
+                    idx_encontrado = idx - 1
 
         n = len(self.archivos_bandeja)
         self.lbl_conteo_huellas.config(text=f"{n} muestras en la carpeta seleccionada")
 
-        if seleccionar_primera and n > 0:
+        if idx_encontrado is not None and 0 <= idx_encontrado < n:
+            self.listbox_huellas.selection_clear(0, tk.END)
+            self.listbox_huellas.selection_set(idx_encontrado)
+            self.listbox_huellas.see(idx_encontrado)
+            self._cargar_previsualizacion_huella(self.archivos_bandeja[idx_encontrado])
+        elif seleccionar_primera and n > 0:
+            self.listbox_huellas.selection_clear(0, tk.END)
             self.listbox_huellas.selection_set(0)
             self._cargar_previsualizacion_huella(self.archivos_bandeja[0])
 
@@ -940,6 +1091,589 @@ class AgenteControlAccesoGUI:
         if elegida:
             self.var_carpeta_salidas.set(os.path.abspath(elegida))
             self._registrar_evento(f"Carpeta de salidas configurada en: {elegida}")
+
+    # --------------------------------------------------------------------------
+    # INTEGRACIÓN Y GENERACIÓN EN VIVO CON ANGULI (MinGW/Wine)
+    # --------------------------------------------------------------------------
+
+    def _verificar_entorno_anguli_o_avisar(self) -> bool:
+        """Verifica que Wine y Anguli.exe estén accesibles. Si no, ofrece buscarlos."""
+        ok, msg = ga.verificar_entorno(self.ruta_anguli)
+        if ok:
+            return True
+
+        # Si falta Anguli.exe, permitir buscar la carpeta
+        if "No se encontró Anguli.exe" in msg:
+            preg = messagebox.askyesno(
+                "Localizar Anguli",
+                f"{msg}\n\n¿Deseás buscar la carpeta donde está 'Anguli.exe'?",
+                parent=self.root,
+            )
+            if preg:
+                elegida = filedialog.askdirectory(
+                    parent=self.root,
+                    title="Seleccionar carpeta que contiene Anguli.exe",
+                    initialdir=os.path.expanduser("~"),
+                )
+                if elegida and os.path.isfile(os.path.join(elegida, "Anguli.exe")):
+                    self.ruta_anguli = os.path.abspath(elegida)
+                    self._registrar_evento(f"Ruta de Anguli actualizada: {self.ruta_anguli}")
+                    return True
+                else:
+                    messagebox.showwarning(
+                        "Anguli no encontrado",
+                        "La carpeta seleccionada no contiene 'Anguli.exe'.",
+                        parent=self.root,
+                    )
+                    return False
+        else:
+            messagebox.showerror("Error de Entorno Anguli / Wine", msg, parent=self.root)
+        return False
+
+    def _actualizar_botones_anguli(self, habilitado: bool) -> None:
+        st = tk.NORMAL if habilitado else tk.DISABLED
+        for btn_name in (
+            "btn_anguli_p1",
+            "btn_anguli_p2",
+            "btn_anguli_p3",
+            "btn_anguli_intrusa",
+            "btn_anguli_dialogo",
+        ):
+            if hasattr(self, btn_name):
+                getattr(self, btn_name).config(state=st)
+
+    def _accion_generar_anguli_autorizada(self, persona_id: int = 1) -> None:
+        """
+        Genera una huella sintética autorizada basada en la semilla oficial del dataset (1604):
+          - Persona 1: clase 'arch', dedo 1
+          - Persona 2: clase 'natural', dedo 2
+          - Persona 3: clase 'natural', dedo 3
+        """
+        if self.generando_huella_anguli:
+            return
+        if not self._verificar_entorno_anguli_o_avisar():
+            return
+
+        persona_id = max(1, min(3, int(persona_id)))
+        clase_txt = "arch" if persona_id == 1 else "natural"
+        carpeta_dest = self.var_carpeta_bandeja.get()
+        kwargs = {
+            "directorio_destino": carpeta_dest,
+            "persona_id": persona_id,
+            "clase": clase_txt,
+            "directorio_anguli": self.ruta_anguli,
+            "con_impresion": True,
+            "ruido": 2,
+            "rayones": 1,
+            "rotacion": 5,
+            "traslacion": 5,
+            "verbose": False,
+        }
+        self._iniciar_hilo_generacion_anguli(
+            func=ga.generar_huella_autorizada_dataset,
+            kwargs=kwargs,
+            descripcion=f"Persona #{persona_id} Autorizada (1604 / {clase_txt})",
+        )
+
+    def _accion_generar_anguli_intrusa(self) -> None:
+        """Genera una huella sintética intrusa con semilla aleatoria y clase whirl."""
+        if self.generando_huella_anguli:
+            return
+        if not self._verificar_entorno_anguli_o_avisar():
+            return
+
+        carpeta_dest = self.var_carpeta_bandeja.get()
+        kwargs = {
+            "directorio_destino": carpeta_dest,
+            "directorio_anguli": self.ruta_anguli,
+            "con_impresion": True,
+            "ruido": 4,
+            "rayones": 2,
+            "verbose": False,
+        }
+        self._iniciar_hilo_generacion_anguli(
+            func=ga.generar_huella_intrusa,
+            kwargs=kwargs,
+            descripcion="Huella Intrusa (Azar / No Autorizada)",
+        )
+
+    def _iniciar_hilo_generacion_anguli(
+        self, func, kwargs: Dict[str, object], descripcion: str
+    ) -> None:
+        self.generando_huella_anguli = True
+        self._actualizar_botones_anguli(habilitado=False)
+        self.lbl_estado_anguli.config(
+            text=f"⏳ Generando {descripcion}...", bg="#fef3c7", fg="#92400e"
+        )
+        self._registrar_evento(f"[Anguli] Iniciando generación de {descripcion} en Wine...")
+
+        def _trabajo():
+            try:
+                ruta = func(**kwargs)
+                self.root.after(
+                    0, self._al_terminar_generacion_anguli, ruta, None, descripcion
+                )
+            except Exception as exc:
+                self.root.after(
+                    0, self._al_terminar_generacion_anguli, None, str(exc), descripcion
+                )
+
+        hilo = threading.Thread(target=_trabajo, daemon=True)
+        hilo.start()
+
+    def _al_terminar_generacion_anguli(
+        self,
+        ruta_generada: Optional[str],
+        error: Optional[str],
+        descripcion: str,
+    ) -> None:
+        self.generando_huella_anguli = False
+        self._actualizar_botones_anguli(habilitado=True)
+
+        if error or not ruta_generada:
+            self.lbl_estado_anguli.config(
+                text="⚠ Error al generar", bg="#fee2e2", fg="#991b1b"
+            )
+            self._registrar_evento(f"[Anguli] Error generando {descripcion}: {error}")
+            messagebox.showerror(
+                "Error en Anguli (Wine)",
+                f"No se pudo completar la generación de la huella:\n\n{error}",
+                parent=self.root,
+            )
+            return
+
+        nombre = os.path.basename(ruta_generada)
+        self.lbl_estado_anguli.config(
+            text=f"✔ Creada: {nombre[:22]}", bg="#dcfce7", fg="#166534"
+        )
+        self._registrar_evento(
+            f"[Anguli] ✔ {descripcion} generada con éxito y añadida a la bandeja: '{nombre}'."
+        )
+
+        # Recargar la bandeja y seleccionar automáticamente la huella recién generada
+        self._recargar_lista_huellas(seleccionar_archivo=ruta_generada)
+        self.notebook.select(self.tab_principal)
+
+    def _abrir_dialogo_anguli_personalizado(self) -> None:
+        """Abre ventana modal para configurar minuciosamente la generación de huellas sintéticas."""
+        if self.generando_huella_anguli:
+            messagebox.showinfo(
+                "Generación en curso",
+                "Ya hay una huella generándose en segundo plano. Aguarde unos segundos.",
+                parent=self.root,
+            )
+            return
+
+        if not self._verificar_entorno_anguli_o_avisar():
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Generador Anguli — Parámetros Personalizados")
+        dlg.geometry("540x600")
+        dlg.minsize(500, 560)
+        dlg.configure(bg="#f8fafc")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        # Encabezado
+        head = tk.Frame(dlg, bg="#0f172a", padx=14, pady=10)
+        head.pack(fill=tk.X)
+        tk.Label(
+            head,
+            text="Generador de Huellas Sintéticas (Anguli / Wine)",
+            bg="#0f172a",
+            fg="#ffffff",
+            font=("DejaVu Sans", 11, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            head,
+            text="Configure semilla, clase y distorsiones (ruido hasta 10, rayones hasta 5)",
+            bg="#0f172a",
+            fg="#94a3b8",
+            font=("DejaVu Sans", 8),
+        ).pack(anchor="w")
+
+        cuerpo = tk.Frame(dlg, bg="#f8fafc", padx=16, pady=12)
+        cuerpo.pack(fill=tk.BOTH, expand=True)
+
+        # 1. Perfiles preconfigurados
+        box_perfiles = tk.LabelFrame(
+            cuerpo,
+            text=" 1. Perfil Rápido de Dataset / Intruso ",
+            bg="#f8fafc",
+            fg="#0f172a",
+            font=("DejaVu Sans", 9, "bold"),
+            padx=10,
+            pady=8,
+        )
+        box_perfiles.pack(fill=tk.X, pady=(0, 8))
+
+        # Variables reactivas
+        var_perfil = tk.StringVar(value="p1")
+        var_seed = tk.StringVar(value=str(ga.SEMILLA_DATASET_DEFAULT))
+        var_clase = tk.StringVar(value="arch")
+        var_dedo = tk.IntVar(value=1)
+        var_impresion = tk.BooleanVar(value=True)
+        var_ruido = tk.IntVar(value=2)
+        var_rayones = tk.IntVar(value=1)
+        var_rotacion = tk.IntVar(value=5)
+        var_traslacion = tk.IntVar(value=5)
+
+        sliders_list = []
+
+        def _actualizar_sliders_estado():
+            activo = var_impresion.get()
+            st = tk.NORMAL if activo else tk.DISABLED
+            for s in sliders_list:
+                s.config(state=st)
+
+        def _aplicar_perfil():
+            p = var_perfil.get()
+            if p == "p1":
+                var_seed.set(str(ga.SEMILLA_DATASET_DEFAULT))
+                var_clase.set("arch")
+                var_dedo.set(1)
+                var_impresion.set(True)
+                var_ruido.set(2)
+                var_rayones.set(1)
+                var_rotacion.set(5)
+                var_traslacion.set(5)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+            elif p == "p2":
+                var_seed.set(str(ga.SEMILLA_DATASET_DEFAULT))
+                var_clase.set("natural")
+                var_dedo.set(2)
+                var_impresion.set(True)
+                var_ruido.set(2)
+                var_rayones.set(1)
+                var_rotacion.set(5)
+                var_traslacion.set(5)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+            elif p == "p3":
+                var_seed.set(str(ga.SEMILLA_DATASET_DEFAULT))
+                var_clase.set("natural")
+                var_dedo.set(3)
+                var_impresion.set(True)
+                var_ruido.set(2)
+                var_rayones.set(1)
+                var_rotacion.set(5)
+                var_traslacion.set(5)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+            elif p == "intrusa_whirl":
+                import random
+                var_seed.set(str(random.randint(100000, 999999)))
+                var_clase.set("whirl")
+                var_dedo.set(1)
+                var_impresion.set(True)
+                var_ruido.set(4)
+                var_rayones.set(2)
+                var_rotacion.set(10)
+                var_traslacion.set(10)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+            elif p == "intrusa_natural":
+                import random
+                var_seed.set(str(random.randint(100000, 999999)))
+                var_clase.set("natural")
+                var_dedo.set(1)
+                var_impresion.set(True)
+                var_ruido.set(4)
+                var_rayones.set(2)
+                var_rotacion.set(10)
+                var_traslacion.set(10)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+
+        rb_grid = tk.Frame(box_perfiles, bg="#f8fafc")
+        rb_grid.pack(fill=tk.X)
+        rb_grid.columnconfigure(0, weight=1)
+        rb_grid.columnconfigure(1, weight=1)
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Persona #1 (1604 — Arch, Dedo 1)",
+            variable=var_perfil,
+            value="p1",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#15803d",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Persona #2 (1604 — Natural, Dedo 2)",
+            variable=var_perfil,
+            value="p2",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#15803d",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        ).grid(row=1, column=0, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Persona #3 (1604 — Natural, Dedo 3)",
+            variable=var_perfil,
+            value="p3",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#15803d",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        ).grid(row=2, column=0, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Intrusa (Azar — Whirl, Dedo 1)",
+            variable=var_perfil,
+            value="intrusa_whirl",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#b91c1c",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        ).grid(row=0, column=1, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Intrusa (Azar — Natural, Dedo 1)",
+            variable=var_perfil,
+            value="intrusa_natural",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#b91c1c",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8),
+        ).grid(row=1, column=1, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Personalizada (libre)",
+            variable=var_perfil,
+            value="manual",
+            bg="#f8fafc",
+            fg="#334155",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8),
+        ).grid(row=2, column=1, sticky="w")
+
+        # 2. Semilla y Clase
+        box_seed = tk.LabelFrame(
+            cuerpo,
+            text=" 2. Semilla, Clase y Dedo ",
+            bg="#f8fafc",
+            fg="#0f172a",
+            font=("DejaVu Sans", 9, "bold"),
+            padx=10,
+            pady=8,
+        )
+        box_seed.pack(fill=tk.X, pady=(0, 8))
+
+        f_seed = tk.Frame(box_seed, bg="#f8fafc")
+        f_seed.pack(fill=tk.X, pady=2)
+        tk.Label(
+            f_seed, text="Semilla (Seed):", width=14, anchor="w", bg="#f8fafc", font=("DejaVu Sans", 8, "bold")
+        ).pack(side=tk.LEFT)
+        ent_seed = tk.Entry(f_seed, textvariable=var_seed, width=12, font=("DejaVu Sans Mono", 9))
+        ent_seed.pack(side=tk.LEFT, padx=(0, 6))
+
+        def _aleatorizar_seed():
+            import random
+            var_seed.set(str(random.randint(100000, 999999)))
+            var_perfil.set("manual")
+
+        tk.Button(
+            f_seed,
+            text="🎲 Aleatoria",
+            command=_aleatorizar_seed,
+            bg="#e2e8f0",
+            relief="flat",
+            font=("DejaVu Sans", 8),
+            padx=6,
+            pady=1,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+
+        def _setear_seed_dataset():
+            var_seed.set(str(ga.SEMILLA_DATASET_DEFAULT))
+            var_perfil.set("manual")
+
+        tk.Button(
+            f_seed,
+            text="Dataset (1604)",
+            command=_setear_seed_dataset,
+            bg="#e2e8f0",
+            relief="flat",
+            font=("DejaVu Sans", 8),
+            padx=6,
+            pady=1,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
+        f_clase = tk.Frame(box_seed, bg="#f8fafc")
+        f_clase.pack(fill=tk.X, pady=(4, 2))
+        tk.Label(
+            f_clase, text="Clase Anguli:", width=14, anchor="w", bg="#f8fafc", font=("DejaVu Sans", 8, "bold")
+        ).pack(side=tk.LEFT)
+        cbo_clase = ttk.Combobox(
+            f_clase,
+            textvariable=var_clase,
+            values=ga.CLASES_PERMITIDAS,
+            state="readonly",
+            width=12,
+            font=("DejaVu Sans", 8),
+        )
+        cbo_clase.pack(side=tk.LEFT, padx=(0, 10))
+
+        tk.Label(
+            f_clase, text="Dedo / Huella #:", bg="#f8fafc", font=("DejaVu Sans", 8, "bold")
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        sp_dedo = tk.Spinbox(
+            f_clase,
+            from_=1,
+            to=10,
+            textvariable=var_dedo,
+            width=4,
+            font=("DejaVu Sans Mono", 9),
+        )
+        sp_dedo.pack(side=tk.LEFT)
+
+        # 3. Impresión y distorsiones (Ruido hasta 10, Rayones hasta 5)
+        box_dist = tk.LabelFrame(
+            cuerpo,
+            text=" 3. Distorsiones Físicas de Escáner (Ruido máx: 10, Rayones máx: 5) ",
+            bg="#f8fafc",
+            fg="#0f172a",
+            font=("DejaVu Sans", 9, "bold"),
+            padx=10,
+            pady=8,
+        )
+        box_dist.pack(fill=tk.X, pady=(0, 8))
+
+        chk_impr = tk.Checkbutton(
+            box_dist,
+            text="Generar impresión simulada (ruido, rayones, rotación, traslación)",
+            variable=var_impresion,
+            command=_actualizar_sliders_estado,
+            bg="#f8fafc",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        )
+        chk_impr.pack(anchor="w", pady=(0, 4))
+
+        f_sliders = tk.Frame(box_dist, bg="#f8fafc")
+        f_sliders.pack(fill=tk.X)
+        f_sliders.columnconfigure(1, weight=1)
+        f_sliders.columnconfigure(3, weight=1)
+
+        # Ruido (0 a 10) y Rayones (0 a 5)
+        tk.Label(f_sliders, text="Ruido (0-10):", bg="#f8fafc", font=("DejaVu Sans", 8)).grid(row=0, column=0, sticky="w")
+        s_ruido = tk.Scale(f_sliders, from_=0, to=10, orient=tk.HORIZONTAL, variable=var_ruido, bg="#f8fafc", highlightthickness=0)
+        s_ruido.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        sliders_list.append(s_ruido)
+
+        tk.Label(f_sliders, text="Rayones (0-5):", bg="#f8fafc", font=("DejaVu Sans", 8)).grid(row=0, column=2, sticky="w")
+        s_ray = tk.Scale(f_sliders, from_=0, to=5, orient=tk.HORIZONTAL, variable=var_rayones, bg="#f8fafc", highlightthickness=0)
+        s_ray.grid(row=0, column=3, sticky="ew")
+        sliders_list.append(s_ray)
+
+        # Rotación y Traslación
+        tk.Label(f_sliders, text="Rotación (0-25°):", bg="#f8fafc", font=("DejaVu Sans", 8)).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        s_rot = tk.Scale(f_sliders, from_=0, to=25, orient=tk.HORIZONTAL, variable=var_rotacion, bg="#f8fafc", highlightthickness=0)
+        s_rot.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(4, 0))
+        sliders_list.append(s_rot)
+
+        tk.Label(f_sliders, text="Traslación (0-25 px):", bg="#f8fafc", font=("DejaVu Sans", 8)).grid(row=1, column=2, sticky="w", pady=(4, 0))
+        s_trans = tk.Scale(f_sliders, from_=0, to=25, orient=tk.HORIZONTAL, variable=var_traslacion, bg="#f8fafc", highlightthickness=0)
+        s_trans.grid(row=1, column=3, sticky="ew", pady=(4, 0))
+        sliders_list.append(s_trans)
+
+        _actualizar_sliders_estado()
+
+        # Botonera inferior
+        btn_box = tk.Frame(cuerpo, bg="#f8fafc", pady=8)
+        btn_box.pack(fill=tk.X, side=tk.BOTTOM)
+
+        def _accion_generar_desde_dialogo():
+            try:
+                seed_val = int(var_seed.get().strip())
+            except ValueError:
+                messagebox.showerror(
+                    "Semilla inválida", "La semilla debe ser un número entero (ej: 1604).", parent=dlg
+                )
+                return
+
+            try:
+                dedo_val = max(1, int(var_dedo.get()))
+            except (ValueError, TypeError):
+                dedo_val = 1
+
+            clase_val = var_clase.get().strip()
+            con_impr = var_impresion.get()
+            ruido_val = min(10, max(0, var_ruido.get())) if con_impr else None
+            ray_val = min(5, max(0, var_rayones.get())) if con_impr else None
+            rot_val = var_rotacion.get() if con_impr else None
+            trans_val = var_traslacion.get() if con_impr else None
+
+            # Construir nombre identificativo
+            ts = datetime.datetime.now().strftime("%H%M%S")
+            tipo_txt = "impr" if con_impr else "master"
+            nombre_gen = f"huella_anguli_seed{seed_val}_{clase_val}_d{dedo_val}_{tipo_txt}_{ts}.jpg"
+
+            kwargs = {
+                "directorio_destino": self.var_carpeta_bandeja.get(),
+                "nombre_archivo": nombre_gen,
+                "clase": clase_val,
+                "dedo": dedo_val,
+                "con_impresion": con_impr,
+                "ruido": ruido_val,
+                "rayones": ray_val,
+                "rotacion": rot_val,
+                "traslacion": trans_val,
+                "seed": seed_val,
+                "directorio_anguli": self.ruta_anguli,
+                "verbose": False,
+            }
+            dlg.destroy()
+
+            desc = f"Huella sintética (Seed: {seed_val}, Clase: {clase_val}, Dedo: {dedo_val})"
+            self._iniciar_hilo_generacion_anguli(
+                func=ga.generar_huella_sintetica,
+                kwargs=kwargs,
+                descripcion=desc,
+            )
+
+        tk.Button(
+            btn_box,
+            text="🚀 GENERAR E INSERTAR EN BANDEJA",
+            command=_accion_generar_desde_dialogo,
+            bg="#2563eb",
+            fg="#ffffff",
+            activebackground="#1d4ed8",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 9, "bold"),
+            relief="flat",
+            pady=8,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+
+        tk.Button(
+            btn_box,
+            text="Cancelar",
+            command=dlg.destroy,
+            bg="#e2e8f0",
+            fg="#0f172a",
+            relief="flat",
+            pady=8,
+            padx=12,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT)
 
     def _al_seleccionar_huella_lista(self, _event=None) -> None:
         sel = self.listbox_huellas.curselection()
