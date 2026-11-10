@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 # Garantizar directorio de caché escribible para Matplotlib en cualquier entorno Linux
 _mpl_default = os.path.expanduser("~/.config/matplotlib")
@@ -572,10 +573,29 @@ class AgenteControlAccesoGUI:
         self.btn_anguli_p3.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 0))
 
         fila_anguli_btn2 = tk.Frame(frame_anguli, bg="#ffffff")
-        fila_anguli_btn2.pack(fill=tk.X, pady=(3, 2))
+        fila_anguli_btn2.pack(fill=tk.X, pady=(2, 2))
+
+        self.btn_anguli_lote_p2_p3 = tk.Button(
+            fila_anguli_btn2,
+            text="👥 Lote 1604: P2 y P3 (descarta 1ra)",
+            command=self._accion_generar_anguli_lote_p2_p3,
+            bg="#0f766e",
+            fg="#ffffff",
+            activebackground="#115e59",
+            activeforeground="#ffffff",
+            font=("DejaVu Sans", 8, "bold"),
+            relief="flat",
+            padx=4,
+            pady=3,
+            cursor="hand2",
+        )
+        self.btn_anguli_lote_p2_p3.pack(fill=tk.X, expand=True)
+
+        fila_anguli_btn3 = tk.Frame(frame_anguli, bg="#ffffff")
+        fila_anguli_btn3.pack(fill=tk.X, pady=(2, 2))
 
         self.btn_anguli_intrusa = tk.Button(
-            fila_anguli_btn2,
+            fila_anguli_btn3,
             text="🚨 Intrusa (Azar)",
             command=self._accion_generar_anguli_intrusa,
             bg="#b91c1c",
@@ -591,7 +611,7 @@ class AgenteControlAccesoGUI:
         self.btn_anguli_intrusa.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 3))
 
         self.btn_anguli_dialogo = tk.Button(
-            fila_anguli_btn2,
+            fila_anguli_btn3,
             text="⚙ Más opciones...",
             command=self._abrir_dialogo_anguli_personalizado,
             bg="#e2e8f0",
@@ -1136,6 +1156,7 @@ class AgenteControlAccesoGUI:
             "btn_anguli_p1",
             "btn_anguli_p2",
             "btn_anguli_p3",
+            "btn_anguli_lote_p2_p3",
             "btn_anguli_intrusa",
             "btn_anguli_dialogo",
         ):
@@ -1148,6 +1169,9 @@ class AgenteControlAccesoGUI:
           - Persona 1: clase 'arch', dedo 1
           - Persona 2: clase 'natural', dedo 2
           - Persona 3: clase 'natural', dedo 3
+          - Persona 1: clase 'arch', 1 identidad
+          - Persona 2: clase 'natural', lote de 3 identidades (descarta #1 y #3, conserva #2)
+          - Persona 3: clase 'natural', lote de 3 identidades (descarta #1 y #2, conserva #3)
         """
         if self.generando_huella_anguli:
             return
@@ -1165,6 +1189,8 @@ class AgenteControlAccesoGUI:
             "con_impresion": True,
             "ruido": 2,
             "rayones": 1,
+            "ruido": 4,
+            "rayones": 2,
             "rotacion": 5,
             "traslacion": 5,
             "verbose": False,
@@ -1173,6 +1199,34 @@ class AgenteControlAccesoGUI:
             func=ga.generar_huella_autorizada_dataset,
             kwargs=kwargs,
             descripcion=f"Persona #{persona_id} Autorizada (1604 / {clase_txt})",
+        )
+
+    def _accion_generar_anguli_lote_p2_p3(self) -> None:
+        """
+        Ejecuta Anguli generando 1 muestra de las 3 personas 'natural' con semilla 1604,
+        descarta la 1ra identidad (reemplazada en el dataset por Arch) y guarda las
+        muestras de Persona 2 y Persona 3 en la bandeja de entrada.
+        """
+        if self.generando_huella_anguli:
+            return
+        if not self._verificar_entorno_anguli_o_avisar():
+            return
+
+        carpeta_dest = self.var_carpeta_bandeja.get()
+        kwargs = {
+            "directorio_destino": carpeta_dest,
+            "directorio_anguli": self.ruta_anguli,
+            "con_impresion": True,
+            "ruido": 4,
+            "rayones": 2,
+            "rotacion": 5,
+            "traslacion": 5,
+            "verbose": False,
+        }
+        self._iniciar_hilo_generacion_anguli(
+            func=ga.generar_lote_personas_2_y_3_dataset,
+            kwargs=kwargs,
+            descripcion="Lote Personas #2 y #3 (1604 Natural, descarta #1)",
         )
 
     def _accion_generar_anguli_intrusa(self) -> None:
@@ -1203,15 +1257,15 @@ class AgenteControlAccesoGUI:
         self.generando_huella_anguli = True
         self._actualizar_botones_anguli(habilitado=False)
         self.lbl_estado_anguli.config(
-            text=f"⏳ Generando {descripcion}...", bg="#fef3c7", fg="#92400e"
+            text=f"⏳ Generando {descripcion[:22]}...", bg="#fef3c7", fg="#92400e"
         )
         self._registrar_evento(f"[Anguli] Iniciando generación de {descripcion} en Wine...")
 
         def _trabajo():
             try:
-                ruta = func(**kwargs)
+                resultado = func(**kwargs)
                 self.root.after(
-                    0, self._al_terminar_generacion_anguli, ruta, None, descripcion
+                    0, self._al_terminar_generacion_anguli, resultado, None, descripcion
                 )
             except Exception as exc:
                 self.root.after(
@@ -1223,14 +1277,14 @@ class AgenteControlAccesoGUI:
 
     def _al_terminar_generacion_anguli(
         self,
-        ruta_generada: Optional[str],
+        resultado_generado: Optional[Union[str, List[str]]],
         error: Optional[str],
         descripcion: str,
     ) -> None:
         self.generando_huella_anguli = False
         self._actualizar_botones_anguli(habilitado=True)
 
-        if error or not ruta_generada:
+        if error or not resultado_generado:
             self.lbl_estado_anguli.config(
                 text="⚠ Error al generar", bg="#fee2e2", fg="#991b1b"
             )
@@ -1242,16 +1296,32 @@ class AgenteControlAccesoGUI:
             )
             return
 
-        nombre = os.path.basename(ruta_generada)
-        self.lbl_estado_anguli.config(
-            text=f"✔ Creada: {nombre[:22]}", bg="#dcfce7", fg="#166534"
-        )
-        self._registrar_evento(
-            f"[Anguli] ✔ {descripcion} generada con éxito y añadida a la bandeja: '{nombre}'."
-        )
+        if isinstance(resultado_generado, list):
+            rutas = [r for r in resultado_generado if r]
+            nombres = [os.path.basename(r) for r in rutas]
+            self.lbl_estado_anguli.config(
+                text=f"✔ Creadas P2 y P3 ({len(rutas)} muestras)",
+                bg="#dcfce7",
+                fg="#166534",
+            )
+            self._registrar_evento(
+                f"[Anguli] ✔ {descripcion}: 1ra identidad descartada; añadidas a la bandeja: "
+                + ", ".join(f"'{n}'" for n in nombres)
+                + "."
+            )
+            ruta_a_seleccionar = rutas[0]
+        else:
+            ruta_a_seleccionar = resultado_generado
+            nombre = os.path.basename(ruta_a_seleccionar)
+            self.lbl_estado_anguli.config(
+                text=f"✔ Creada: {nombre[:22]}", bg="#dcfce7", fg="#166534"
+            )
+            self._registrar_evento(
+                f"[Anguli] ✔ {descripcion} generada con éxito y añadida a la bandeja: '{nombre}'."
+            )
 
         # Recargar la bandeja y seleccionar automáticamente la huella recién generada
-        self._recargar_lista_huellas(seleccionar_archivo=ruta_generada)
+        self._recargar_lista_huellas(seleccionar_archivo=ruta_a_seleccionar)
         self.notebook.select(self.tab_principal)
 
     def _abrir_dialogo_anguli_personalizado(self) -> None:
@@ -1271,6 +1341,8 @@ class AgenteControlAccesoGUI:
         dlg.title("Generador Anguli — Parámetros Personalizados")
         dlg.geometry("540x600")
         dlg.minsize(500, 560)
+        dlg.geometry("560x625")
+        dlg.minsize(520, 585)
         dlg.configure(bg="#f8fafc")
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1316,6 +1388,8 @@ class AgenteControlAccesoGUI:
         var_impresion = tk.BooleanVar(value=True)
         var_ruido = tk.IntVar(value=2)
         var_rayones = tk.IntVar(value=1)
+        var_ruido = tk.IntVar(value=4)
+        var_rayones = tk.IntVar(value=2)
         var_rotacion = tk.IntVar(value=5)
         var_traslacion = tk.IntVar(value=5)
 
@@ -1336,6 +1410,8 @@ class AgenteControlAccesoGUI:
                 var_impresion.set(True)
                 var_ruido.set(2)
                 var_rayones.set(1)
+                var_ruido.set(4)
+                var_rayones.set(2)
                 var_rotacion.set(5)
                 var_traslacion.set(5)
                 chk_impr.config(state=tk.NORMAL)
@@ -1347,6 +1423,8 @@ class AgenteControlAccesoGUI:
                 var_impresion.set(True)
                 var_ruido.set(2)
                 var_rayones.set(1)
+                var_ruido.set(4)
+                var_rayones.set(2)
                 var_rotacion.set(5)
                 var_traslacion.set(5)
                 chk_impr.config(state=tk.NORMAL)
@@ -1358,6 +1436,19 @@ class AgenteControlAccesoGUI:
                 var_impresion.set(True)
                 var_ruido.set(2)
                 var_rayones.set(1)
+                var_ruido.set(4)
+                var_rayones.set(2)
+                var_rotacion.set(5)
+                var_traslacion.set(5)
+                chk_impr.config(state=tk.NORMAL)
+                _actualizar_sliders_estado()
+            elif p == "lote_p2_p3":
+                var_seed.set(str(ga.SEMILLA_DATASET_DEFAULT))
+                var_clase.set("natural")
+                var_dedo.set(2)
+                var_impresion.set(True)
+                var_ruido.set(4)
+                var_rayones.set(2)
                 var_rotacion.set(5)
                 var_traslacion.set(5)
                 chk_impr.config(state=tk.NORMAL)
@@ -1406,7 +1497,7 @@ class AgenteControlAccesoGUI:
 
         tk.Radiobutton(
             rb_grid,
-            text="Persona #2 (1604 — Natural, Dedo 2)",
+            text="Persona #2 (1604 — Natural, de 3)",
             variable=var_perfil,
             value="p2",
             command=_aplicar_perfil,
@@ -1418,7 +1509,7 @@ class AgenteControlAccesoGUI:
 
         tk.Radiobutton(
             rb_grid,
-            text="Persona #3 (1604 — Natural, Dedo 3)",
+            text="Persona #3 (1604 — Natural, de 3)",
             variable=var_perfil,
             value="p3",
             command=_aplicar_perfil,
@@ -1427,6 +1518,18 @@ class AgenteControlAccesoGUI:
             activebackground="#f8fafc",
             font=("DejaVu Sans", 8, "bold"),
         ).grid(row=2, column=0, sticky="w")
+
+        tk.Radiobutton(
+            rb_grid,
+            text="Lote P2 y P3 (1604 — 3 Nat, descarta #1)",
+            variable=var_perfil,
+            value="lote_p2_p3",
+            command=_aplicar_perfil,
+            bg="#f8fafc",
+            fg="#0f766e",
+            activebackground="#f8fafc",
+            font=("DejaVu Sans", 8, "bold"),
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
 
         tk.Radiobutton(
             rb_grid,
@@ -1601,6 +1704,28 @@ class AgenteControlAccesoGUI:
         btn_box.pack(fill=tk.X, side=tk.BOTTOM)
 
         def _accion_generar_desde_dialogo():
+            perfil_sel = var_perfil.get()
+            con_impr = var_impresion.get()
+
+            if perfil_sel == "lote_p2_p3":
+                kwargs_lote = {
+                    "directorio_destino": self.var_carpeta_bandeja.get(),
+                    "con_impresion": con_impr,
+                    "ruido": min(10, max(0, var_ruido.get())) if con_impr else 0,
+                    "rayones": min(5, max(0, var_rayones.get())) if con_impr else 0,
+                    "rotacion": var_rotacion.get() if con_impr else 0,
+                    "traslacion": var_traslacion.get() if con_impr else 0,
+                    "directorio_anguli": self.ruta_anguli,
+                    "verbose": False,
+                }
+                dlg.destroy()
+                self._iniciar_hilo_generacion_anguli(
+                    func=ga.generar_lote_personas_2_y_3_dataset,
+                    kwargs=kwargs_lote,
+                    descripcion="Lote Personas #2 y #3 (1604 Natural, descarta #1)",
+                )
+                return
+
             try:
                 seed_val = int(var_seed.get().strip())
             except ValueError:
